@@ -450,6 +450,13 @@
 			</div>
 		</div>
 
+		<!-- performance (benchmark) -->
+		<div x-data="t_perf">
+			<div x-for="item in lista">
+				<div class="perf-item" x-bind="{item.nome}"></div>
+			</div>
+		</div>
+
 		<!-- listas simultâneas -->
 		<div x-data="t_multi_a">
 			<div x-for="item in lista">
@@ -786,9 +793,9 @@
 					await wait(30);
 					const t0 = performance.now();
 					try {
-						await t.fn();
+						const ret = await t.fn();
 						const ms = Math.round(performance.now() - t0);
-						setTestStatus(gi, ti, 'pass', 'ok', ms);
+						setTestStatus(gi, ti, 'pass', typeof ret === 'string' ? ret : 'ok', ms);
 						_results.pass++; gPass++;
 					} catch (e) {
 						const ms = Math.round(performance.now() - t0);
@@ -2916,6 +2923,191 @@
 					shadowProxy.onError = null;
 					assert(T('[x-data="t_err_bind"] .eb-good').textContent.trim() === 'ok-irmao', 'irmão não renderizou após erro no vizinho');
 					assert(T('[x-data="t_err_bind"] .eb-bad').textContent.trim() === '', 'nó com erro deveria renderizar vazio, não travar');
+				}
+			},
+		]);
+
+
+		// ─────────────────────────────────────────────
+		//  ⏱️ Performance — benchmark (sem sleeps fixos)
+		// ─────────────────────────────────────────────
+		// Mede "mutação → DOM atualizado": t0 antes da mutação, t1 depois de esgotar as
+		// microtasks (setTimeout 0). O custo do próprio flush é medido e descontado.
+		// Cada benchmark roda 1 warmup + N execuções e reporta mediana / min / p95.
+		// Os orçamentos abaixo são tetos folgados para pegar regressões grosseiras:
+		// ajuste conforme os números da sua máquina.
+		const PERF_BUDGET = {
+			render1k: 600,      // lista nova de 1.000 itens (do zero)
+			replace1k: 600,     // trocar 1.000 itens por outros 1.000
+			update1: 50,        // 1 item em 1.000
+			burst100: 100,      // 100 updates no mesmo tick
+			push1: 100,         // push de 1 item em ~1.000
+			splice1: 100,       // remover 1 item do meio
+			reverse1k: 600,     // reordenar 1.000 itens
+			clear1k: 200,       // esvaziar 1.000 itens
+		};
+
+		const _bench = [];
+		const flush = () => new Promise(r => setTimeout(r, 0));
+		const perfEl = () => TA('[x-data="t_perf"] .perf-item');
+		const perfStore = () => shadowProxy.template.t_perf;
+		const perfMake = (n, p = 'P') => Array.from({ length: n }, (_, i) => ({ nome: `${p}${i}` }));
+		const fmt = (n) => (n < 10 ? n.toFixed(2) : n.toFixed(1));
+
+		async function perfEnsure(n) {
+			if (perfEl().length === n) return;
+			perfStore().lista = perfMake(n, 'E');
+			await flush();
+		}
+
+		async function bench(label, { runs = 10, warmup = 1, setup, action, items }) {
+			const probe = [];
+			for (let i = 0; i < 5; i++) { const t = performance.now(); await flush(); probe.push(performance.now() - t); }
+			const floor = Math.min(...probe);
+
+			const samples = [];
+			for (let i = 0; i < warmup + runs; i++) {
+				if (setup) await setup(i);   // fora da medição
+				const t0 = performance.now();
+				action(i);
+				await flush();
+				const ms = Math.max(0, performance.now() - t0 - floor);
+				if (i >= warmup) samples.push(ms);
+			}
+			samples.sort((a, b) => a - b);
+			const r = {
+				label, runs,
+				median: samples[Math.floor(samples.length / 2)],
+				min: samples[0],
+				p95: samples[Math.min(samples.length - 1, Math.ceil(samples.length * 0.95) - 1)],
+				items,
+			};
+			_bench.push(r);
+			return r;
+		}
+
+		const perfLine = (r) => `mediana ${fmt(r.median)}ms · min ${fmt(r.min)}ms · p95 ${fmt(r.p95)}ms`
+			+ (r.items ? ` · ${fmt(r.median / r.items * 1000)}µs/item` : '');
+
+		function perfCheck(r, budget) {
+			assert(r.median < budget, `acima do orçamento (${budget}ms) — ${perfLine(r)}`);
+			return perfLine(r) + ` (teto ${budget}ms)`;
+		}
+
+		group('⏱️ Performance — benchmark', [
+			{
+				name: 'Render inicial de 1.000 itens (do zero)',
+				fn: async () => {
+					await perfEnsure(0);
+					const r = await bench('render 1k', {
+						runs: 8, items: 1000,
+						action: (i) => { perfStore().lista = perfMake(1000, `R${i}_`); },
+					});
+					assert(perfEl().length === 1000, `esperado 1000, got ${perfEl().length}`);
+					const out = perfCheck(r, PERF_BUDGET.render1k);
+					perfStore().lista = []; await flush();
+					return out;
+				}
+			},
+			{
+				name: 'Trocar a lista inteira (1.000 → 1.000 novos)',
+				fn: async () => {
+					await perfEnsure(1000);
+					const r = await bench('replace 1k', {
+						runs: 8, items: 1000,
+						action: (i) => { perfStore().lista = perfMake(1000, `T${i}_`); },
+					});
+					assert(perfEl().length === 1000, `esperado 1000, got ${perfEl().length}`);
+					assert(perfEl()[999].textContent.trim() === 'T8_999', 'conteúdo final errado');
+					return perfCheck(r, PERF_BUDGET.replace1k);
+				}
+			},
+			{
+				name: 'Update pontual (1 item em 1.000)',
+				fn: async () => {
+					await perfEnsure(1000);
+					const r = await bench('update 1 / 1k', {
+						runs: 30,
+						action: (i) => { perfStore().lista[500].nome = `U${i}`; },
+					});
+					assert(perfEl()[500].textContent.trim() === 'U30', 'update não chegou ao DOM');
+					return perfCheck(r, PERF_BUDGET.update1);
+				}
+			},
+			{
+				name: 'Rajada de 100 updates no mesmo tick',
+				fn: async () => {
+					await perfEnsure(1000);
+					const r = await bench('burst 100', {
+						runs: 10, items: 100,
+						action: (i) => {
+							for (let j = 0; j < 100; j++) perfStore().lista[j * 10].nome = `B${i}_${j}`;
+						},
+					});
+					assert(perfEl()[990].textContent.trim() === 'B10_99', 'rajada não chegou ao DOM');
+					return perfCheck(r, PERF_BUDGET.burst100);
+				}
+			},
+			{
+				name: 'Append (push de 1 item em ~1.000)',
+				fn: async () => {
+					await perfEnsure(1000);
+					const r = await bench('push 1', {
+						runs: 10,
+						action: (i) => { perfStore().lista.push({ nome: `N${i}` }); },
+					});
+					assert(perfEl().length === 1011, `esperado 1011, got ${perfEl().length}`);
+					return perfCheck(r, PERF_BUDGET.push1);
+				}
+			},
+			{
+				name: 'Remover do meio (splice de 1 item)',
+				fn: async () => {
+					await perfEnsure(1000);
+					const r = await bench('splice 1', {
+						runs: 10,
+						action: () => { perfStore().lista.splice(500, 1); },
+					});
+					assert(perfEl().length === 989, `esperado 989, got ${perfEl().length}`);
+					return perfCheck(r, PERF_BUDGET.splice1);
+				}
+			},
+			{
+				name: 'Reordenar (reverse em 1.000 itens)',
+				fn: async () => {
+					perfStore().lista = perfMake(1000, 'V'); await flush();
+					const r = await bench('reverse 1k', {
+						runs: 6, items: 1000,
+						action: () => { perfStore().lista.reverse(); },
+					});
+					// 1 warmup + 6 runs = 7 reverses (ímpar) → lista invertida
+					assert(perfEl()[0].textContent.trim() === 'V999', 'ordem final errada');
+					return perfCheck(r, PERF_BUDGET.reverse1k);
+				}
+			},
+			{
+				name: 'Limpar lista (1.000 → 0)',
+				fn: async () => {
+					const r = await bench('clear 1k', {
+						runs: 6, items: 1000,
+						setup: async (i) => { perfStore().lista = perfMake(1000, `C${i}_`); await flush(); },
+						action: () => { perfStore().lista = []; },
+					});
+					assert(perfEl().length === 0, `esperado 0, got ${perfEl().length}`);
+					return perfCheck(r, PERF_BUDGET.clear1k);
+				}
+			},
+			{
+				name: 'Relatório (tabela no console)',
+				fn: async () => {
+					console.table(_bench.map(r => ({
+						benchmark: r.label,
+						'mediana ms': +r.median.toFixed(2),
+						'min ms': +r.min.toFixed(2),
+						'p95 ms': +r.p95.toFixed(2),
+						'µs/item': r.items ? +(r.median / r.items * 1000).toFixed(2) : '',
+					})));
+					return `${_bench.length} benchmarks — veja o console (F12)`;
 				}
 			},
 		]);

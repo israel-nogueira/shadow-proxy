@@ -1,5 +1,5 @@
 /*!
- * shadow-proxy v2.7.4
+ * shadow-proxy v2.8.0
  * Reactive DOM binding via Recursive Proxy
  * https://github.com/israel-nogueira/shadow-proxy
  *
@@ -7,127 +7,90 @@
  *   x-for="item in lista"                    → reactive loop (nestable)
  *   x-for="item, k in lista"                 → loop with named index alias
  *   x-for="item in lista as k"               → alternative syntax for named index
- *   x-key="item.id"                          → optional unique key for x-for (fallback: auto __nid)
+ *   x-key="item.id"                          → optional unique key for x-for
+ *   x-static                                 → (filho de x-for) elemento fixo, fora do template (ex: <option value="">)
  *   x-bind="item.titulo"                     → reactive text / interpolation with {var}
  *   x-if="item.ativo"                        → reactive conditional
  *   x-on:event="expr"                        → event listener with loop scope
- *   x-model="elemento_01.nome"               → two-way binding (input/checkbox/radio/select)
- *   x-model="elemento_01.lista[1].titulo"    → deep path two-way binding
+ *   x-model="elemento_01.nome"               → two-way binding (input/checkbox/radio/select/textarea)
  *   x-ref="nome"                             → element reference via $ref.nome
+ *   x-cloak                                  → escondido até o 1º render
  *
- * Magic variables (available in x-on expressions):
- *   $root                  → root DOM element of the x-data container
- *   $ref.nome              → element marked with x-ref="nome"
- *   $emit(name, detail)    → dispatch CustomEvent on $root
- *   $i / $index            → current loop index (fallback when no alias declared)
- *   $this.index            → current item index
- *   $this.dom              → current item DOM element
- *   $this.data             → current item data object
- *   $this.parent           → $this of parent loop (chainable)
+ * Magic variables (x-on): $root, $ref.nome, $emit(name, detail), $i / $index,
+ *                         $this.index / .dom / .data / .parent
  *
- * Lifecycle hooks (per component key):
- *   shadowProxy.template.key.$beforeRender = fn    → called before every render
- *   shadowProxy.template.key.$afterRender  = fn    → called after every render
- *   el.addEventListener('before-render', fn) → same via DOM event
- *   el.addEventListener('after-render', fn)  → same via DOM event
+ * Lifecycle: $beforeRender / $afterRender / $beforeDestroy / $afterDestroy (+ DOM events)
+ * Watchers : shadowProxy.on('key.prop', (newVal, oldVal) => {})
  *
- * Watchers:
- *   shadowProxy.on('key.prop', (newVal, oldVal) => {})   → watch any deep path
- *
- * v2.7.4 — structuredClone in _snapshotAncestors (deep watcher oldVal fix)
- *           textarea support in x-model
- *           Renamed global export proxy → shadowProxy (collision-safe)
- * v2.7.1 —  Early template cache in initProxy (x-for with empty arrays)
- *           Centralized error reporting via _reportError + shadowProxy.onError handler
- * v2.3.0 — Granular reactivity (track/trigger)
- * v2.3.1 — Fixes: x-bind granular, _syncModelsForKey, _renderTracked propagation
- * v2.4.0 — Magic vars: $root, $ref, $emit, $this (+parent), $i/$index
- *           Named index alias: "item, k in lista" / "item in lista as k"
- *           Lifecycle hooks: $beforeRender / $afterRender (template + DOM event)
- *           Watchers: shadowProxy.on(path, fn)
- *           Surgical trigger: single-effect updates run synchronously
+ * v2.8.0 — Fixes:
+ *   - Só Array/objeto literal viram proxy (Date, Map, Set, Blob... intactos)
+ *   - x-for: lista vazia destrói nós (effects/listeners); scope do loop herda o store (prototype);
+ *     precedência do loop sobre o store no x-on; x-model dentro do loop; filhos x-static;
+ *     SVG; itens inalterados não re-renderizam nem re-bindam
+ *   - Blocklist separada: identificadores livres x propriedades (item.parent / location / history / open... liberados)
+ *   - Sandbox: bloqueia Window/Document em qualquer leitura, innerHTML/ownerDocument/on* em Nodes,
+ *     escrita nos globais seguros, setAttribute de on* /src / href em Nodes
+ * - Parser: ?. , typeof, **, 1e3, identificadores unicode
+        * - set trap faz unwrap de proxies(sort / reverse / splice sem proxy dentro do raw)
+ * - Atributos: "{" preservado quando não é expressão(pattern = "\d{3}", JSON); boolean attrs; value / checked sync;
+ * srcdoc bloqueado
+    * - x - model: path bloqueado(prototype pollution), number / range, select multiple, sem duplo bind
+        * - Effects com flag dead; watchers: unsubscribe seguro, template.key = { ...} notifica
+            * - Guard de loop em _scheduleApply; hooks($before...) não disparam render; ordem do $beforeRender
+                * - Objetos frozen / sealed; _store / _proxies / _watchers sem prototype; x - data aninhado isolado; x - cloak
+                     
  */
 
 var shadowProxy = (function () {
 
     'use strict';
 
-    const _store = {};
-    const _proxies = {};
+    const _store = Object.create(null);
+    const _proxies = Object.create(null);
 
-    // Symbol privado ao módulo — substitui a string '__isProxy' (spoofável)
     const _PROXY_SYM = Symbol('shadowProxy');
+    const _SCOPE_VARS = Symbol('shadowProxyScopeVars');
+    const _HOOKS = new Set(['$beforeRender', '$afterRender', '$beforeDestroy', '$afterDestroy']);
+    const _destroyBound = new WeakSet();
 
     // ─── Shadow State Store ─────────────────────────────────────────────────
-    // Substitui o padrão antigo de props soltas no elemento (`el.__shadowX`)
-    // por um registro dinâmico via WeakMap, chaveado por elemento DOM.
-    //
-    // Motivo: props soltas no mesmo namespace (`__shadowEffect`) colidiam
-    // quando duas diretivas diferentes precisavam de estado próprio no
-    // mesmo nó (ex: x-for + x-model no mesmo <select> — ver CHANGELOG 2.7.5).
-    // Com o state store, cada diretiva usa sua própria key sem risco de
-    // sobrescrever a de outra, e o WeakMap libera o estado sozinho via GC
-    // quando o elemento sai do DOM e não sobra outra referência.
-
     const _shadowState = new WeakMap();
 
     function _sGet(el, key) {
-        return _shadowState.get(el)?.[key];
+        const b = _shadowState.get(el);
+        return b ? b[key] : undefined;
     }
-
     function _sSet(el, key, value) {
         if (!_shadowState.has(el)) _shadowState.set(el, {});
         _shadowState.get(el)[key] = value;
         return value;
     }
-
-    function _sHas(el, key) {
-        return !!_shadowState.get(el) && key in _shadowState.get(el);
-    }
-
     function _sDelete(el, key) {
         const bucket = _shadowState.get(el);
         if (bucket) delete bucket[key];
     }
 
-    function _sClear(el) {
-        _shadowState.delete(el);
-    }
-
-    // Debug helper — WeakMap não aparece ao inspecionar o elemento no devtools.
-    function _sDebug(el) {
-        return Object.assign({}, _shadowState.get(el));
-    }
-
     // ─── Error reporting ──────────────────────────────────────────────────────
-    // Centraliza todos os erros da lib. Use _reportError() em vez de console.*
-    // O dev pode sobrescrever shadowProxy.onError para capturar/rotear os erros.
-
     const ERROR_TYPES = {
-        X_FOR_SYNTAX  : 'x-for-syntax',
-        X_ON_UNSAFE   : 'x-on-unsafe',
-        X_BIND_EVAL   : 'x-bind-eval',
-        X_IF_EVAL     : 'x-if-eval',
-        RENDER_ERROR  : 'render-error',
-        MODEL_PATH    : 'model-path',
-        WATCHER_ERROR : 'watcher-error',
-        LIFECYCLE     : 'lifecycle-error',
-        PROXY_TARGET  : 'proxy-target',
-        SECURITY_BLOCKED : 'security-blocked',
+        X_FOR_SYNTAX: 'x-for-syntax',
+        X_ON_UNSAFE: 'x-on-unsafe',
+        X_BIND_EVAL: 'x-bind-eval',
+        X_IF_EVAL: 'x-if-eval',
+        RENDER_ERROR: 'render-error',
+        MODEL_PATH: 'model-path',
+        WATCHER_ERROR: 'watcher-error',
+        LIFECYCLE: 'lifecycle-error',
+        PROXY_TARGET: 'proxy-target',
+        SECURITY_BLOCKED: 'security-blocked',
     };
 
     function _elementId(el) {
         if (!el || !el.tagName) return 'unknown';
-        return el.tagName + (el.id ? '#' + el.id : '') + (el.className ? '.' + String(el.className).trim().split(/\s+/).join('.') : '');
+        return el.tagName + (el.id ? '#' + el.id : '') + (el.className && typeof el.className === 'string' ? '.' + el.className.trim().split(/\s+/).join('.') : '');
     }
 
     function _reportError(type, message, ctx) {
-        const err = Object.assign({
-            type      : type,
-            message   : message,
-            timestamp : Date.now(),
-        }, ctx || {});
-
+        const err = Object.assign({ type: type, message: message, timestamp: Date.now() }, ctx || {});
         if (typeof shadowProxy.onError === 'function') {
             try { shadowProxy.onError(err); } catch (e) { console.error('[shadow-proxy] onError threw:', e); }
         } else {
@@ -135,36 +98,42 @@ var shadowProxy = (function () {
         }
     }
 
-    // ─── Watchers — shadowProxy.on(path, fn) ───────────────────────────────────────
-    // Observa qualquer caminho profundo do store. Dispara com (newVal, oldVal).
+    // ─── Helpers de objeto ────────────────────────────────────────────────────
+    // Só Array e objetos literais/null-proto são proxificados (Date, Map, Set, Blob... ficam crus).
+    function _isProxyable(v) {
+        if (Array.isArray(v)) return true;
+        const proto = Object.getPrototypeOf(v);
+        return proto === Object.prototype || proto === null;
+    }
 
-    const _watchers = {};   // { 'key.prop.sub': Set<fn> }
+    function _allKeys(scope) {
+        const ks = [];
+        for (const k in scope) ks.push(k);
+        return ks;
+    }
 
-    // ─── Model registry ───────────────────────────────────────────────────────
-    // Evita querySelectorAll global no _syncModelsForKey.
-    // Cadastrado no _initModels, limpo no _destroyKey.
-    const _modelRegistry = new Map(); // key → Set<el>
+    function _pick(obj, parts) {
+        for (let i = 0; i < parts.length; i++) {
+            if (obj == null) return undefined;
+            obj = obj[parts[i]];
+        }
+        return obj;
+    }
 
-    // ─── Pending binds — retry após store populado ────────────────────────────
-    // Elementos com x-on cuja expressão usava prop ainda inexistente no store.
-    // Não é falha de segurança — apenas timing: store vazio no momento do bind.
-    // Reprocessados a cada _applyTarget do key correspondente.
-    const _pendingBinds = new Map(); // key → Set<{ el, scope, key }>
+    // ─── Watchers ─────────────────────────────────────────────────────────────
+    const _watchers = Object.create(null);
+    const _modelRegistry = new Map();
+    const _pendingBinds = new Map();
 
     function _modelRegistryAdd(key, el) {
         if (!_modelRegistry.has(key)) _modelRegistry.set(key, new Set());
         _modelRegistry.get(key).add(el);
     }
+    function _modelRegistryRemove(key) { _modelRegistry.delete(key); }
 
-    function _modelRegistryRemove(key) {
-        _modelRegistry.delete(key);
-    }
-    // _snapshotAncestors: captura o valor atual de cada ancestro ANTES da mutação.
-    // Deve ser chamado no set() do proxy, antes de target[prop] = value.
-    // Retorna Map<ancestorPath, oldVal> para uso posterior no _notifyWatchers.
     function _snapshotAncestors(path) {
         const snapshots = new Map();
-        if (Object.keys(_watchers).length === 0) return snapshots; // sem watchers registrados, nada a capturar
+        if (Object.keys(_watchers).length === 0) return snapshots;
         let idx = path.lastIndexOf('.');
         while (idx !== -1) {
             const ancestorPath = path.slice(0, idx);
@@ -175,11 +144,8 @@ var shadowProxy = (function () {
                     try {
                         snapshot = structuredClone(val);
                     } catch (e) {
-                        try {
-                            snapshot = Object.assign(Array.isArray(val) ? [] : {}, val);
-                        } catch (e2) {
-                            snapshot = val;
-                        }
+                        try { snapshot = Object.assign(Array.isArray(val) ? [] : {}, val); }
+                        catch (e2) { snapshot = val; }
                     }
                 } else {
                     snapshot = val;
@@ -191,19 +157,16 @@ var shadowProxy = (function () {
         return snapshots;
     }
 
-    function _notifyWatchers(path, newVal, oldVal, ancestorSnapshots) {
+    function _notifyWatchers(path, newVal, oldVal, ancestorSnapshots, noBubble) {
         if (newVal !== oldVal) {
             const fns = _watchers[path];
             if (fns && fns.size) {
-                fns.forEach(fn => { try { fn(newVal, oldVal); } catch (e) { _reportError(ERROR_TYPES.WATCHER_ERROR, 'Watcher threw', { path: path, message: e.message }); } });
+                fns.forEach(function (fn) {
+                    try { fn(newVal, oldVal); } catch (e) { _reportError(ERROR_TYPES.WATCHER_ERROR, 'Watcher threw', { path: path, message: e.message }); }
+                });
             }
         }
-
-        // Borbulha pros caminhos ancestrais com oldVal correto (capturado antes da mutação).
-        // IMPORTANTE: objetos são mutados in-place — ancestorNewVal === ancestorOldVal sempre
-        // (mesma referência). Por isso disparamos se há snapshot (mudança confirmada) OU
-        // se newVal !== oldVal (a mudança folha garante que o ancestro mudou).
-        if (newVal === oldVal) return; // sem mudança real, não borbulha
+        if (newVal === oldVal || noBubble) return;
 
         let idx = path.lastIndexOf('.');
         while (idx !== -1) {
@@ -214,33 +177,31 @@ var shadowProxy = (function () {
                 const ancestorOldVal = ancestorSnapshots && ancestorSnapshots.has(ancestorPath)
                     ? ancestorSnapshots.get(ancestorPath)
                     : ancestorNewVal;
-                // Sempre dispara: mudança profunda confirmada (newVal !== oldVal acima)
-                fns.forEach(fn => { try { fn(ancestorNewVal, ancestorOldVal); } catch (e) { _reportError(ERROR_TYPES.WATCHER_ERROR, 'Watcher threw', { path: ancestorPath, message: e.message }); } });
+                fns.forEach(function (fn) {
+                    try { fn(ancestorNewVal, ancestorOldVal); } catch (e) { _reportError(ERROR_TYPES.WATCHER_ERROR, 'Watcher threw', { path: ancestorPath, message: e.message }); }
+                });
             }
             idx = ancestorPath.lastIndexOf('.');
         }
     }
-    
 
     function _registerWatcher(path, fn) {
         if (!_watchers[path]) _watchers[path] = new Set();
         _watchers[path].add(fn);
-        return function () { _watchers[path].delete(fn); };  // retorna unsubscribe
+        return function () {
+            const s = _watchers[path];
+            if (!s) return;
+            s.delete(fn);
+            if (!s.size) delete _watchers[path];
+        };
     }
 
-
-    //
-    // _deps: WeakMap<rawObject, Map<prop, Set<Effect>>>
-    //
-    // Durante o render de um nó, _activeEffect aponta para o Effect daquele nó.
-    // Qualquer get() de proxy registra a dependência automaticamente.
-    // Quando a prop muda, trigger() agenda só os Effects dependentes.
-
+    // ─── Granular reactivity — track / trigger ───────────────────────────────
     const _deps = new WeakMap();
     let _activeEffect = null;
 
     function _track(rawObj, prop) {
-        if (!_activeEffect) return;
+        if (!_activeEffect || _activeEffect.dead) return;
         if (!_deps.has(rawObj)) _deps.set(rawObj, new Map());
         const propMap = _deps.get(rawObj);
         if (!propMap.has(prop)) propMap.set(prop, new Set());
@@ -251,36 +212,41 @@ var shadowProxy = (function () {
         }
     }
 
-    function _trigger(rawObj, prop) {
-        if (!_deps.has(rawObj)) return false;
+    function _hasEffects(rawObj, prop) {
         const propMap = _deps.get(rawObj);
-        if (!propMap.has(prop)) return false;
+        if (!propMap) return false;
         const effects = propMap.get(prop);
-        if (!effects.size) return false;
+        return !!(effects && effects.size);
+    }
 
-        // Sempre agenda via microtask — elimina o caminho síncrono que rodava
-        // efeitos de 1 dependência na hora, fora do batch (causava re-render
-        // duplicado quando 2+ props do mesmo effect mudavam no mesmo tick)
-        effects.forEach(e => e.schedule());
+    function _trigger(rawObj, prop) {
+        if (!_hasEffects(rawObj, prop)) return false;
+        _deps.get(rawObj).get(prop).forEach(function (e) { e.schedule(); });
         return true;
     }
 
-
     // ─── Effect ───────────────────────────────────────────────────────────────
-
     function _createEffect(fn) {
         const effect = {
-            fn,
+            fn: fn,
             deps: new Set(),
             scheduled: false,
-            key: null,    // root key para _syncModelsForKey após flush
+            dead: false,
+            key: null,
 
             cleanup() {
-                effect.deps.forEach(depSet => depSet.delete(effect));
+                effect.deps.forEach(function (depSet) { depSet.delete(effect); });
                 effect.deps.clear();
             },
 
+            kill() {
+                effect.dead = true;
+                effect.cleanup();
+                _pendingEffects.delete(effect);
+            },
+
             run() {
+                if (effect.dead) return;
                 effect.cleanup();
                 const prev = _activeEffect;
                 _activeEffect = effect;
@@ -288,7 +254,7 @@ var shadowProxy = (function () {
             },
 
             schedule() {
-                if (effect.scheduled) return;
+                if (effect.dead || effect.scheduled) return;
                 effect.scheduled = true;
                 _pendingEffects.add(effect);
                 _scheduleFlush();
@@ -298,16 +264,7 @@ var shadowProxy = (function () {
     }
 
     // ─── Flush de effects (microtask) ────────────────────────────────────────
-    // Usa Promise.resolve() — dispara antes do próximo frame e antes de qualquer
-    // setTimeout, garantindo reatividade quasi-síncrona sem bloquear a thread.
-    //
-    // Proteção contra re-entrância: se um effect muta dados durante o run(),
-    // os novos effects são colocados em _pendingEffects e processados na próxima
-    // geração (máximo de _FLUSH_MAX_GENERATIONS gerações por tick).
-    // Se o limite for atingido, um erro é reportado via _reportError.
-
     const _FLUSH_MAX_GENERATIONS = 10;
-
     const _pendingEffects = new Set();
     let _flushQueued = false;
     let _flushDepth = 0;
@@ -325,6 +282,7 @@ var shadowProxy = (function () {
                         'Loop de reatividade detectado: ' + _FLUSH_MAX_GENERATIONS + ' gerações de effects sem estabilizar. Verifique mutations dentro de renders.',
                         { pendingCount: _pendingEffects.size }
                     );
+                    _pendingEffects.forEach(function (e) { e.scheduled = false; });
                     _pendingEffects.clear();
                     break;
                 }
@@ -334,9 +292,17 @@ var shadowProxy = (function () {
                 _pendingEffects.clear();
 
                 const keysToSync = new Set();
-                batch.forEach(e => {
+                batch.forEach(function (e) {
                     e.scheduled = false;
-                    e.run();
+                    if (e.dead) return;
+                    try {
+                        e.run();
+                    } catch (err) {
+                        _reportError(ERROR_TYPES.RENDER_ERROR, 'Effect threw durante o flush', {
+                            message: err && err.message,
+                            component: e.key,
+                        });
+                    }
                     if (e.key) keysToSync.add(e.key);
                 });
 
@@ -347,128 +313,176 @@ var shadowProxy = (function () {
         });
     }
 
-    // ─── Batching para _applyTarget (push/splice/substituição de lista) ───────
-    // Também usa microtask — consistência no timing entre os dois paths.
-
+    // ─── Batching para _applyTarget ──────────────────────────────────────────
     const _pendingKeys = new Set();
-    const _pendingKeysNeedRender = new Set(); // subset de _pendingKeys que precisa do cascade completo
+    const _pendingKeysNeedRender = new Set();
     let _applyQueued = false;
+    let _applyChain = 0;
+    let _applyBlocked = false;
+    const _APPLY_MAX_CHAIN = 100;
 
-    // needsRender=true (default) → cascade completo (push/splice/substituição de lista,
-    // 1ª atribuição de key). needsRender=false → só dispara lifecycle/sync, o(s) effect(s)
-    // granular(es) já cuidaram do nó certo via _trigger.
     function _scheduleApply(key, needsRender) {
         if (needsRender === undefined) needsRender = true;
+        if (_forErrDeps[key]) _trigger(_forErrDeps[key], 'v');
         _pendingKeys.add(key);
         if (needsRender) _pendingKeysNeedRender.add(key);
         if (_applyQueued) return;
         _applyQueued = true;
         Promise.resolve().then(function () {
             _applyQueued = false;
+
+            // Guard: hooks ($afterRender etc.) que mutam o store em cadeia infinita
+            if (++_applyChain === 1) {
+                setTimeout(function () { _applyChain = 0; _applyBlocked = false; }, 0);
+            }
+            if (_applyChain > _APPLY_MAX_CHAIN) {
+                if (!_applyBlocked) {
+                    _applyBlocked = true;
+                    _reportError(ERROR_TYPES.RENDER_ERROR,
+                        'Loop de render detectado: ' + _APPLY_MAX_CHAIN + ' ciclos seguidos. Verifique mutations em $afterRender/$beforeRender/watchers.',
+                        { pendingCount: _pendingKeys.size });
+                }
+                _pendingKeys.clear();
+                _pendingKeysNeedRender.clear();
+                return;
+            }
+
             const keys = [..._pendingKeys];
             const needRender = new Set(_pendingKeysNeedRender);
             _pendingKeys.clear();
             _pendingKeysNeedRender.clear();
-            keys.forEach(function (k) { _applyTarget(k, needRender.has(k)); });
+            keys.forEach(function (k) {
+                try {
+                    _applyTarget(k, needRender.has(k));
+                } catch (err) {
+                    _reportError(ERROR_TYPES.RENDER_ERROR, '_applyTarget threw', {
+                        message: err && err.message,
+                        component: k,
+                    });
+                }
+            });
             keys.forEach(_syncModelsForKey);
         });
     }
 
-    // ─── Segurança — parser AST mínimo ───────────────────────────────────────────
-    //
-    // Valida expressões x-on sem dependências externas.
-    // Suporta: atribuições, chamadas, encadeamento, ++/--, operadores lógicos,
-    //          ternário, múltiplas expressões separadas por ; e variáveis mágicas.
-    // Bloqueia: constructor, eval, fetch, window, document, __proto__, etc.
+    // ─── Segurança — parser AST mínimo ───────────────────────────────────────
 
-    // Identificadores globais sempre permitidos
     const _SAFE_GLOBALS = new Set([
-        'true', 'false', 'null', 'undefined', 'event',
+        'true', 'false', 'null', 'undefined', 'event', 'typeof',
         'Math', 'JSON', 'Date', 'Number', 'String', 'Boolean', 'Array', 'Object',
         'parseInt', 'parseFloat', 'isNaN', 'isFinite'
     ]);
 
-    // Identificadores sempre bloqueados independente do scope
-    // adiciona bloqueio a métodos de introspecção de protótipo ───
-    const _BLOCKED_IDS = new Set([
-        'constructor', 'prototype', '__proto__', '__defineGetter__', '__defineSetter__',
-        'eval', 'Function', 'fetch', 'XMLHttpRequest', 'WebSocket', 'Worker',
-        'window', 'document', 'globalThis', 'global', 'self', 'top', 'parent', 'frames',
-        'location', 'history', 'navigator', 'screen', 'alert', 'confirm', 'prompt',
-        'setTimeout', 'setInterval', 'clearTimeout', 'clearInterval',
-        'requestAnimationFrame', 'cancelAnimationFrame',
-        'import', 'require', 'module', 'exports', 'process', '__dirname', '__filename',
-        'Reflect', 'Proxy', 'Symbol', 'WeakMap', 'WeakSet', 'WeakRef',
-        'atob', 'btoa', 'open', 'close', 'postMessage',
-        // fix: bypass via Object.getPrototypeOf(obj) contornava o blocklist de
-        // 'constructor'/'prototype'/'__proto__' pois usava nome de método diferente
+    // Propriedades bloqueadas em QUALQUER acesso a membro (a.b / a['b'])
+    const _BLOCKED_PROPS = new Set([
+        'constructor', 'prototype', '__proto__', '__raw',
+        '__defineGetter__', '__defineSetter__', '__lookupGetter__', '__lookupSetter__',
+        'caller', 'callee', 'arguments', 'call', 'apply', 'bind',
         'getPrototypeOf', 'setPrototypeOf', 'getOwnPropertyDescriptor',
-        'getOwnPropertyDescriptors', 'defineProperty', 'defineProperties', 'create',
+        'getOwnPropertyDescriptors', 'defineProperty', 'defineProperties',
     ]);
 
-    // Tokenizer mínimo
-    // Retorna array de tokens: { type, value }
-    // Types: 'str', 'num', 'op', 'id', 'punc'
+    // Identificadores LIVRES bloqueados (globais perigosos). Nomes ambíguos
+    // (parent, top, self, location, history, open, close, process, module...)
+    // só resolvem contra o scope, então são dados do usuário — liberados.
+    const _BLOCKED_IDS = new Set([
+        'eval', 'Function', 'fetch', 'XMLHttpRequest', 'WebSocket', 'Worker',
+        'window', 'document', 'globalThis', 'global', 'navigator', 'alert', 'confirm', 'prompt',
+        'setTimeout', 'setInterval', 'clearTimeout', 'clearInterval',
+        'requestAnimationFrame', 'cancelAnimationFrame',
+        'import', 'require',
+        'Reflect', 'Proxy', 'Symbol', 'WeakMap', 'WeakSet', 'WeakRef',
+        'atob', 'btoa', 'postMessage',
+    ]);
+    _BLOCKED_PROPS.forEach(function (p) { _BLOCKED_IDS.add(p); });
+
+    // Propriedades de Node bloqueadas (vazam Document/Window ou injetam HTML)
+    const _NODE_BLOCKED = new Set([
+        'ownerDocument', 'defaultView', 'contentWindow', 'contentDocument',
+        'innerHTML', 'outerHTML', 'insertAdjacentHTML', 'srcdoc', 'cookie'
+    ]);
+
+    const _TWO_CHAR_OPS = ['++', '--', '+=', '-=', '*=', '/=', '%=',
+        '==', '!=', '<=', '>=', '&&', '||', '??', '=>', '**'];
+    const _STR_ESCAPES = { n: '\n', t: '\t', r: '\r' };
+
     function _tokenize(expr) {
         const tokens = [];
         let i = 0;
         const len = expr.length;
 
         while (i < len) {
-            // Whitespace
             if (/\s/.test(expr[i])) { i++; continue; }
 
-            // String literal simples ou dupla
+            // String
             if (expr[i] === '\'' || expr[i] === '"') {
                 const q = expr[i++];
                 let s = '';
                 while (i < len && expr[i] !== q) {
-                    if (expr[i] === '\\') { s += expr[i++]; } // escape
-                    s += expr[i++];
+                    if (expr[i] === '\\' && i + 1 < len) {
+                        i++;
+                        const esc = expr[i++];
+                        s += (esc in _STR_ESCAPES) ? _STR_ESCAPES[esc] : esc;
+                    } else {
+                        s += expr[i++];
+                    }
                 }
                 if (expr[i] === q) i++;
                 tokens.push({ type: 'str', value: s });
                 continue;
             }
 
-            // Número
-            if (/[0-9]/.test(expr[i]) || (expr[i] === '.' && /[0-9]/.test(expr[i+1]))) {
+            // Número (um ponto decimal, expoente)
+            if (/[0-9]/.test(expr[i]) || (expr[i] === '.' && /[0-9]/.test(expr[i + 1] || ''))) {
                 let n = '';
-                while (i < len && /[0-9.]/.test(expr[i])) n += expr[i++];
+                let hasDot = false;
+                while (i < len) {
+                    const c = expr[i];
+                    if (/[0-9]/.test(c)) { n += c; i++; continue; }
+                    if (c === '.' && !hasDot && /[0-9]/.test(expr[i + 1] || '')) { hasDot = true; n += c; i++; continue; }
+                    break;
+                }
+                const m = /^[eE][+-]?[0-9]+/.exec(expr.slice(i));
+                if (m) { n += m[0]; i += m[0].length; }
                 tokens.push({ type: 'num', value: n });
                 continue;
             }
 
-            // Identificador ou keyword
-            if (/[A-Za-z_$]/.test(expr[i])) {
+            // Identificador (unicode)
+            if (/[\p{L}_$]/u.test(expr[i])) {
                 let id = '';
-                while (i < len && /[A-Za-z0-9_$]/.test(expr[i])) id += expr[i++];
+                while (i < len && /[\p{L}\p{N}_$]/u.test(expr[i])) id += expr[i++];
                 tokens.push({ type: 'id', value: id });
                 continue;
             }
 
-            // Operadores compostos e simples
-            const twoChar = expr.slice(i, i + 2);
-            if (['++', '--', '+=', '-=', '*=', '/=', '%=',
-                 '==', '!=', '<=', '>=', '===', '!==',
-                 '&&', '||', '??', '=>'].includes(twoChar)) {
-                // verifica 3 chars primeiro
-                const threeChar = expr.slice(i, i + 3);
-                if (['===', '!=='].includes(threeChar)) {
-                    tokens.push({ type: 'op', value: threeChar }); i += 3;
-                } else {
-                    tokens.push({ type: 'op', value: twoChar }); i += 2;
-                }
+            // Operadores de 3 chars
+            const threeChar = expr.slice(i, i + 3);
+            if (threeChar === '===' || threeChar === '!==') {
+                tokens.push({ type: 'op', value: threeChar });
+                i += 3;
                 continue;
             }
 
-            // Char único permitido
+            // Optional chaining (não confunde com ternário "a?.5:1")
+            if (expr[i] === '?' && expr[i + 1] === '.' && !/[0-9]/.test(expr[i + 2] || '')) {
+                tokens.push({ type: 'op', value: '?.' });
+                i += 2;
+                continue;
+            }
+
+            const twoChar = expr.slice(i, i + 2);
+            if (_TWO_CHAR_OPS.includes(twoChar)) {
+                tokens.push({ type: 'op', value: twoChar });
+                i += 2;
+                continue;
+            }
+
             if ('=+-*/%!<>&|?:.,;()[]{}'.includes(expr[i])) {
                 tokens.push({ type: 'punc', value: expr[i++] });
                 continue;
             }
 
-            // Qualquer outro char → bloqueia
             return null;
         }
 
@@ -476,36 +490,32 @@ var shadowProxy = (function () {
     }
 
     // ─── Parser AST + Interpreter ────────────────────────────────────────────
-    //
-    // Substitui `new Function(...)` como motor de avaliação de expressões.
-    // Motivo: o validador por token (_validateTokens, abaixo) só inspeciona
-    // tokens do tipo 'id' contra _BLOCKED_IDS — mas acesso via bracket notation
-    // com string literal (ex: a['constructor']) gera token 'str', que NUNCA
-    // passava pela checagem. Isso permitia escapar do sandbox e chegar em
-    // `Function`/`window`/etc mesmo com o blocklist ativo.
-    //
-    // O interpreter abaixo nunca gera código executável a partir de string —
-    // ele anda numa AST e resolve cada acesso a propriedade (dot OU bracket,
-    // literal OU dinâmico) contra o MESMO blocklist, em runtime, via
-    // _assertSafeProp(). Não importa como o nome da propriedade foi montado
-    // (literal, concatenação, variável) — o que importa é o valor final, e
-    // esse valor é sempre checado antes do get/set/call acontecer.
-    //
-    // _validateTokens/_safeExpr (mais abaixo) continuam existindo apenas como
-    // heurística para decidir "bind agora" vs "aguardar prop existir no
-    // store" em _bindEvents — não são mais a fronteira de segurança real.
-
-    function _assertSafeProp(name) {
-        if (_BLOCKED_IDS.has(name)) {
-            throw new _SecurityError('Acesso bloqueado: "' + name + '"');
-        }
-    }
 
     function _SecurityError(message) {
         this.name = 'SecurityError';
         this.message = message;
     }
     _SecurityError.prototype = Object.create(Error.prototype);
+
+    function _assertSafeProp(name) {
+        if (_BLOCKED_PROPS.has(name)) throw new _SecurityError('Acesso bloqueado: "' + name + '"');
+    }
+    function _assertSafeId(name) {
+        if (_BLOCKED_IDS.has(name)) throw new _SecurityError('Acesso bloqueado: "' + name + '"');
+    }
+
+    // Nenhuma leitura pode devolver Window/Document/Function (cobre event.view,
+    // getRootNode(), composedPath()[n], parentNode encadeado, etc.)
+    function _guardValue(v) {
+        if (v === window || v === document || v === globalThis || v === Function) {
+            throw new _SecurityError('Acesso bloqueado a objeto global');
+        }
+        return v;
+    }
+
+    function _isNode(o) {
+        return typeof Node !== 'undefined' && o instanceof Node;
+    }
 
     const ASSIGN_OPS = new Set(['=', '+=', '-=', '*=', '/=', '%=']);
 
@@ -523,8 +533,6 @@ var shadowProxy = (function () {
         return true;
     };
     _Parser.prototype.isPunc = function (v) { return this.is('punc', v); };
-    // operadores de 1 char vêm como 'punc', os de 2+ chars como 'op' —
-    // unifica a checagem por VALOR, ignorando o type.
     _Parser.prototype.isAnyOp = function (v) {
         const t = this.peek();
         return !!t && (t.type === 'op' || t.type === 'punc') && t.value === v;
@@ -587,10 +595,19 @@ var shadowProxy = (function () {
     _Parser.prototype.parseEquality = function () { return this._parseBinaryLevel(['==', '!=', '===', '!=='], this.parseRelational.bind(this)); };
     _Parser.prototype.parseRelational = function () { return this._parseBinaryLevel(['<', '>', '<=', '>='], this.parseAdditive.bind(this)); };
     _Parser.prototype.parseAdditive = function () { return this._parseBinaryLevel(['+', '-'], this.parseMultiplicative.bind(this)); };
-    _Parser.prototype.parseMultiplicative = function () { return this._parseBinaryLevel(['*', '/', '%'], this.parseUnary.bind(this)); };
+    _Parser.prototype.parseMultiplicative = function () { return this._parseBinaryLevel(['*', '/', '%'], this.parseExponent.bind(this)); };
+    _Parser.prototype.parseExponent = function () {
+        const left = this.parseUnary();
+        if (this.isAnyOp('**')) {
+            this.next();
+            const right = this.parseExponent();
+            return { type: 'BinaryExpression', operator: '**', left: left, right: right };
+        }
+        return left;
+    };
     _Parser.prototype._parseBinaryLevel = function (ops, nextFn) {
         let left = nextFn();
-        for (;;) {
+        for (; ;) {
             const t = this.peek();
             if (!t || (t.type !== 'op' && t.type !== 'punc') || ops.indexOf(t.value) === -1) break;
             this.next();
@@ -601,6 +618,10 @@ var shadowProxy = (function () {
     };
     _Parser.prototype.parseUnary = function () {
         const t = this.peek();
+        if (t && t.type === 'id' && t.value === 'typeof') {
+            this.next();
+            return { type: 'UnaryExpression', operator: 'typeof', argument: this.parseUnary() };
+        }
         if (t && (t.type === 'punc' || t.type === 'op') && ['!', '-', '+'].indexOf(t.value) !== -1) {
             this.next();
             return { type: 'UnaryExpression', operator: t.value, argument: this.parseUnary() };
@@ -623,10 +644,34 @@ var shadowProxy = (function () {
         }
         return node;
     };
+    _Parser.prototype._parseArgs = function () {
+        const args = [];
+        if (!this.isPunc(')')) {
+            args.push(this.parseAssignment());
+            while (this.isPunc(',')) { this.next(); args.push(this.parseAssignment()); }
+        }
+        this.expectPunc(')');
+        return args;
+    };
     _Parser.prototype.parseCallMember = function () {
         let node = this.parsePrimary();
-        for (;;) {
-            if (this.isPunc('.')) {
+        for (; ;) {
+            if (this.is('op', '?.')) {
+                this.next();
+                if (this.isPunc('(')) {
+                    this.next();
+                    node = { type: 'CallExpression', callee: node, arguments: this._parseArgs(), optional: true };
+                } else if (this.isPunc('[')) {
+                    this.next();
+                    const property = this.parseAssignment();
+                    this.expectPunc(']');
+                    node = { type: 'MemberExpression', object: node, property: property, computed: true, optional: true };
+                } else {
+                    const prop = this.next();
+                    if (!prop || prop.type !== 'id') throw new SyntaxError('Esperado identificador após "?."');
+                    node = { type: 'MemberExpression', object: node, property: { type: 'Identifier', name: prop.value }, computed: false, optional: true };
+                }
+            } else if (this.isPunc('.')) {
                 this.next();
                 const prop = this.next();
                 if (!prop || prop.type !== 'id') throw new SyntaxError('Esperado identificador após "."');
@@ -638,13 +683,7 @@ var shadowProxy = (function () {
                 node = { type: 'MemberExpression', object: node, property: property, computed: true };
             } else if (this.isPunc('(')) {
                 this.next();
-                const args = [];
-                if (!this.isPunc(')')) {
-                    args.push(this.parseAssignment());
-                    while (this.isPunc(',')) { this.next(); args.push(this.parseAssignment()); }
-                }
-                this.expectPunc(')');
-                node = { type: 'CallExpression', callee: node, arguments: args };
+                node = { type: 'CallExpression', callee: node, arguments: this._parseArgs() };
             } else break;
         }
         return node;
@@ -682,7 +721,7 @@ var shadowProxy = (function () {
             this.next();
             const properties = [];
             if (!this.isPunc('}')) {
-                for (;;) {
+                for (; ;) {
                     const keyTok = this.next();
                     if (!keyTok || (keyTok.type !== 'id' && keyTok.type !== 'str')) throw new SyntaxError('Chave de objeto inválida');
                     this.expectPunc(':');
@@ -704,14 +743,11 @@ var shadowProxy = (function () {
         return new _Parser(tokens).parseProgram();
     }
 
-    // Cache de AST — chaveado só pelo texto da expressão (a AST não depende
-    // do shape do scope, diferente do `new Function` antigo que precisava
-    // recompilar por combinação de chaves). LRU simples com teto fixo.
     const _AST_CACHE_MAX = 500;
     const _astCache = new Map();
     function _getAST(expr) {
         let ast = _astCache.get(expr);
-        if (ast) { _astCache.delete(expr); _astCache.set(expr, ast); return ast; } // marca como recém-usado
+        if (ast) { _astCache.delete(expr); _astCache.set(expr, ast); return ast; }
         ast = _parseAST(expr);
         if (_astCache.size >= _AST_CACHE_MAX) _astCache.delete(_astCache.keys().next().value);
         _astCache.set(expr, ast);
@@ -723,21 +759,39 @@ var shadowProxy = (function () {
         Boolean: Boolean, Array: Array, Object: Object,
         parseInt: parseInt, parseFloat: parseFloat, isNaN: isNaN, isFinite: isFinite,
     };
+    const _SAFE_OBJS = Object.keys(_INTERP_SAFE_GLOBALS).map(function (k) { return _INTERP_SAFE_GLOBALS[k]; });
 
-    function _Interpreter(scope) { this.scope = scope; }
+    // lenient=true (render): identificador inexistente → undefined (e ainda rastreia a dependência).
+    // lenient=false (x-on): lança ReferenceError.
+    function _Interpreter(scope, lenient) { this.scope = scope; this.lenient = !!lenient; }
     _Interpreter.prototype.run = function (ast) {
         let result;
         for (let i = 0; i < ast.body.length; i++) result = this.evalNode(ast.body[i]);
         return result;
     };
+    _Interpreter.prototype._checkNodeCall = function (obj, key, args) {
+        if (!_isNode(obj)) return;
+        const k = String(key);
+        if (k === 'setAttribute' || k === 'setAttributeNS') {
+            const name = String(k === 'setAttribute' ? args[0] : args[1]);
+            if (/^(on|src|href|action|formaction|srcdoc|xlink)/i.test(name)) {
+                throw new _SecurityError('setAttribute bloqueado: "' + name + '"');
+            }
+        }
+    };
     _Interpreter.prototype.evalNode = function (node) {
         switch (node.type) {
             case 'Literal': return node.value;
             case 'Identifier': {
-                if (node.name === 'undefined') return undefined;
-                if (Object.prototype.hasOwnProperty.call(_INTERP_SAFE_GLOBALS, node.name)) return _INTERP_SAFE_GLOBALS[node.name];
-                if (!(node.name in this.scope)) throw new ReferenceError('"' + node.name + '" não existe no scope');
-                return this.scope[node.name];
+                const name = node.name;
+                if (Object.prototype.hasOwnProperty.call(_INTERP_SAFE_GLOBALS, name)) return _INTERP_SAFE_GLOBALS[name];
+                _assertSafeId(name);
+                const v = this.scope[name];   // leitura sempre acontece → rastreia dependência
+                if (v === undefined && !(name in this.scope)) {
+                    if (this.lenient) return undefined;
+                    throw new ReferenceError('"' + name + '" não existe no scope');
+                }
+                return _guardValue(v);
             }
             case 'ArrayExpression':
                 return node.elements.map(function (el) { return this.evalNode(el); }, this);
@@ -752,26 +806,39 @@ var shadowProxy = (function () {
             }
             case 'MemberExpression': {
                 const r = this._resolveMember(node);
-                return r.obj == null ? undefined : r.obj[r.key];
+                return r.obj == null ? undefined : _guardValue(r.obj[r.key]);
             }
             case 'CallExpression': {
                 if (node.callee.type === 'MemberExpression') {
                     const r = this._resolveMember(node.callee);
-                    if (r.obj == null) throw new TypeError('Chamando método em null/undefined');
+                    if (r.obj == null) {
+                        if (node.callee.optional || node.optional) return undefined;
+                        throw new TypeError('Chamando método em null/undefined');
+                    }
                     const fn = r.obj[r.key];
-                    if (typeof fn !== 'function') throw new TypeError('"' + r.key + '" não é função');
+                    if (fn == null && node.optional) return undefined;
+                    if (typeof fn !== 'function') throw new TypeError('"' + String(r.key) + '" não é função');
                     const args = node.arguments.map(function (a) { return this.evalNode(a); }, this);
-                    return fn.apply(r.obj, args);
+                    this._checkNodeCall(r.obj, r.key, args);
+                    return _guardValue(fn.apply(r.obj, args));
                 }
                 if (node.callee.type === 'Identifier') {
                     const fn = this.evalNode(node.callee);
+                    if (fn == null && node.optional) return undefined;
                     if (typeof fn !== 'function') throw new TypeError('"' + node.callee.name + '" não é função');
                     const args = node.arguments.map(function (a) { return this.evalNode(a); }, this);
-                    return fn.apply(null, args);
+                    return _guardValue(fn.apply(null, args));
                 }
                 throw new _SecurityError('Chamada não suportada');
             }
             case 'UnaryExpression': {
+                if (node.operator === 'typeof') {
+                    const a = node.argument;
+                    if (a.type === 'Identifier' &&
+                        !Object.prototype.hasOwnProperty.call(_INTERP_SAFE_GLOBALS, a.name) &&
+                        !(a.name in this.scope)) return 'undefined';
+                    return typeof this.evalNode(a);
+                }
                 const v = this.evalNode(node.argument);
                 if (node.operator === '!') return !v;
                 if (node.operator === '-') return -v;
@@ -793,6 +860,7 @@ var shadowProxy = (function () {
                     case '*': return l * r;
                     case '/': return l / r;
                     case '%': return l % r;
+                    case '**': return Math.pow(l, r);
                     case '==': return l == r;
                     case '!=': return l != r;
                     case '===': return l === r;
@@ -833,88 +901,64 @@ var shadowProxy = (function () {
                 throw new _SecurityError('Nó não suportado: ' + node.type);
         }
     };
-    // Resolve um MemberExpression validando CADA propriedade no caminho —
-    // dot ou bracket, literal ou dinâmica. É aqui que o bypass de bracket
-    // notation com string (ex: a['constructor']) finalmente é barrado,
-    // porque o valor de `key` já foi computado — não importa como.
     _Interpreter.prototype._resolveMember = function (node) {
         const obj = this.evalNode(node.object);
         const key = node.computed ? this.evalNode(node.property) : node.property.name;
-        _assertSafeProp(String(key));
+        const skey = typeof key === 'symbol' ? '' : String(key);
+        _assertSafeProp(skey);
+        if (obj != null && _isNode(obj) && _NODE_BLOCKED.has(skey)) {
+            throw new _SecurityError('Acesso bloqueado: "' + skey + '"');
+        }
         return { obj: obj, key: key };
     };
     _Interpreter.prototype._resolveLValue = function (node) {
         if (node.type === 'Identifier') {
-            _assertSafeProp(node.name);
+            _assertSafeId(node.name);
             return { key: node.name, isIdentifier: true };
         }
         const r = this._resolveMember(node);
+        if (r.obj != null) {
+            if (_SAFE_OBJS.indexOf(r.obj) !== -1) throw new _SecurityError('Escrita bloqueada em global');
+            if (_isNode(r.obj) && /^on/i.test(String(r.key))) throw new _SecurityError('Escrita bloqueada: "' + String(r.key) + '"');
+        }
         return { obj: r.obj, key: r.key, isIdentifier: false };
     };
 
-    // Valida lista de tokens contra o scope
-    // Regra: todo 'id' que não vem após '.' e não é global/scope é bloqueado.
-    // Qualquer id em _BLOCKED_IDS é sempre bloqueado.
-    // '=>' (arrow fn) nunca é permitido.
+    // Heurística de bind (bind agora x aguardar prop existir) — NÃO é a fronteira de segurança.
     function _validateTokens(tokens, scopeKeys) {
-        if (!tokens) return false; // tokenização falhou
-
-        let braceDepth = 0; // profundidade de { } — pra distinguir chave de objeto de variável
+        if (!tokens) return false;
+        let braceDepth = 0;
 
         for (let i = 0; i < tokens.length; i++) {
             const tok = tokens[i];
 
             if (tok.type === 'punc' && tok.value === '{') { braceDepth++; continue; }
             if (tok.type === 'punc' && tok.value === '}') { braceDepth = Math.max(0, braceDepth - 1); continue; }
-
-            // Arrow function nunca permitida
             if (tok.type === 'op' && tok.value === '=>') return false;
-
             if (tok.type !== 'id') continue;
 
-            // Sempre bloqueado
+            const prev = tokens[i - 1];
+            if (prev && ((prev.type === 'punc' && prev.value === '.') || (prev.type === 'op' && prev.value === '?.'))) continue;
+
             if (_BLOCKED_IDS.has(tok.value)) return false;
 
-            // Vem após '.' → é propriedade, não variável livre
-            const prev = tokens[i - 1];
-            if (prev && prev.type === 'punc' && prev.value === '.') continue;
-
-            // Chave de objeto literal (ex: { val: 42 }) → não é leitura de variável
             const next = tokens[i + 1];
             if (braceDepth > 0 && next && next.type === 'punc' && next.value === ':') continue;
-
-            // Alvo de atribuição simples (ex: "out = ...") → cria prop nova no
-            // store, não precisa existir previamente no scope. Só vale pra
-            // identificador "solto" (não member expression tipo "a.b = x",
-            // que já cai no "prev is '.'" acima só pra 'b'; 'a' aqui precisaria
-            // existir de qualquer forma pois é leitura implícita do objeto).
             if (next && next.type === 'punc' && next.value === '=') continue;
-
-            // Global seguro
             if (_SAFE_GLOBALS.has(tok.value)) continue;
-
-            // No scope
             if (scopeKeys.has(tok.value)) continue;
 
-            // Desconhecido → bloqueia
             return false;
         }
-
         return true;
     }
 
-    function _safeExpr(expr, scope) {
+    function _safeExpr(expr, scopeKeys) {
         const trimmed = expr.trim();
         if (!trimmed) return false;
-
-        const scopeKeys = scope ? new Set(Object.keys(scope)) : new Set();
-        const tokens = _tokenize(trimmed);
-        return _validateTokens(tokens, scopeKeys);
+        return _validateTokens(_tokenize(trimmed), scopeKeys || new Set());
     }
 
-    // _isBlockedExpr: verifica apenas _BLOCKED_IDS, sem exigir que o scope
-    // contenha todas as props. Usado para distinguir "prop ainda não existe"
-    // de "expressão genuinamente perigosa" no retry de _pendingBinds.
     function _isBlockedExpr(expr) {
         const tokens = _tokenize(expr.trim());
         if (!tokens) return true;
@@ -922,20 +966,17 @@ var shadowProxy = (function () {
             if (tok.type === 'op' && tok.value === '=>') return true;
             if (tok.type !== 'id') return false;
             const prev = tokens[i - 1];
-            if (prev && prev.type === 'punc' && prev.value === '.') return false;
+            if (prev && ((prev.type === 'punc' && prev.value === '.') || (prev.type === 'op' && prev.value === '?.'))) return false;
             return _BLOCKED_IDS.has(tok.value);
         });
     }
 
-    // _evalExpr: avalia expressão reativa via parser+interpreter (sem eval/
-    // new Function). O AST vem do cache global (_getAST); o scope passado
-    // aqui é só o objeto de leitura — nenhuma escrita "vaza" pra fora dele.
-    function _evalExpr(expr, scope, componentKey) {
+    function _evalExpr(expr, scope, componentKey, errType) {
         try {
             const ast = _getAST(expr);
-            return new _Interpreter(scope).run(ast);
+            return new _Interpreter(scope, true).run(ast);
         } catch (e) {
-            const type = (e instanceof _SecurityError) ? ERROR_TYPES.SECURITY_BLOCKED : ERROR_TYPES.X_BIND_EVAL;
+            const type = (e instanceof _SecurityError) ? ERROR_TYPES.SECURITY_BLOCKED : (errType || ERROR_TYPES.X_BIND_EVAL);
             _reportError(type, 'Falha ao avaliar expressão', {
                 expr: expr,
                 message: e.message,
@@ -945,34 +986,49 @@ var shadowProxy = (function () {
         }
     }
 
-    // AST cache é global por texto de expressão (não por componente), então
-    // não há nada pra purgar por key no destroy — mantido como no-op pra não
-    // quebrar a chamada existente em _destroyKey.
-    function _purgeExprCache(key) { /* no-op — ver comentário acima */ }
-
+    // "{...}" que não é expressão válida (pattern="\d{3}", JSON) é preservado como texto.
     function _interpolate(str, scope, componentKey) {
-        return str.replace(/\{([^}]+)\}/g, (_, expr) => {
-            const val = _evalExpr(expr.trim(), scope, componentKey);
+        return str.replace(/\{([^}]+)\}/g, function (match, expr) {
+            const e = expr.trim();
+            if (/^\d+\s*(,\s*\d*)?$/.test(e)) return match;     // quantificador regex {3} {2,5}
+            try { _getAST(e); } catch (err) { return match; }   // não é expressão
+            const val = _evalExpr(e, scope, componentKey);
             return val != null ? val : '';
         });
     }
 
     function _isTruthy(expr, scope, componentKey) {
-        return !!_evalExpr(expr, scope, componentKey);
+        return !!_evalExpr(expr, scope, componentKey, ERROR_TYPES.X_IF_EVAL);
     }
+
+    // ─── Sanitização de atributos interpolados ───────────────────────────────
+    const _URL_ATTRS = new Set(['href', 'src', 'action', 'formaction', 'xlink:href', 'data', 'poster', 'srcset']);
+
+    function _isUnsafeUrl(value) {
+        const s = String(value).replace(/[\u0000-\u0020\u007f-\u009f]+/g, '').toLowerCase();
+        return /^(javascript|vbscript|data:text\/html)/.test(s);
+    }
+
+    const _BOOL_ATTRS = new Set(['disabled', 'checked', 'selected', 'readonly', 'required', 'hidden', 'multiple',
+        'autofocus', 'open', 'async', 'defer', 'novalidate', 'autoplay', 'controls', 'loop', 'muted', 'reversed', 'inert']);
+    const _BOOL_PROPS = { readonly: 'readOnly', novalidate: 'noValidate' };
 
     // ─── x-model ──────────────────────────────────────────────────────────────
 
     function _parsePath(path) {
         const parts = path.replace(/\[(\d+)\]/g, '.$1').split('.');
-        return { key: parts[0], parts };
+        return { key: parts[0], parts: parts };
     }
 
-    // _setDeep — remove fallback que escrevia direto em _store sem passar pelo proxy ───
+    function _unsafePath(parts) {
+        return parts.some(function (p) { return _BLOCKED_PROPS.has(p); });
+    }
+
     function _setDeep(parts, value) {
-        // Garante que o proxy do key existe antes de navegar — mesma lógica
-        // usada no `get` trap de initProxy(). Elimina o fallback antigo que
-        // gravava direto em _store e pulava o set trap (sem _trigger/watchers).
+        if (_unsafePath(parts)) {
+            _reportError(ERROR_TYPES.MODEL_PATH, 'Caminho bloqueado no x-model', { path: parts.join('.') });
+            return;
+        }
         if (!_proxies[parts[0]]) {
             if (!_store[parts[0]]) _store[parts[0]] = {};
             _proxies[parts[0]] = _makeProxy(_store[parts[0]], parts[0]);
@@ -981,141 +1037,144 @@ var shadowProxy = (function () {
         let obj = _proxies[parts[0]];
         for (let i = 1; i < parts.length - 1; i++) {
             obj = obj[parts[i]];
-            if (obj == null) return;
+            if (obj == null) {
+                _reportError(ERROR_TYPES.MODEL_PATH, 'Caminho inexistente no x-model', { path: parts.join('.') });
+                return;
+            }
         }
         obj[parts[parts.length - 1]] = value;
     }
 
     function _getDeep(parts) {
         let obj = _store;
-        for (const k of parts) {
+        for (let i = 0; i < parts.length; i++) {
             if (obj == null) return undefined;
-            obj = obj[k];
+            obj = obj[parts[i]];
         }
         return obj;
     }
 
-
-    function _resolveModel(el) {
-        const modelAttr = el.getAttribute('x-model');
-        const {
-            parts
-        } = _parsePath(modelAttr);
-        const container = el.closest('[x-data],[proxy-target]');
-        if (!container) return {
-            key: parts[0],
-            parts
-        };
-        const key = container.getAttribute('x-data') || container.getAttribute('proxy-target');
-        // x-model é relativo ao container (ex: "form.nome", sem prefixo do key).
-        // Todo o resto da lib (effects, _setDeep, _syncModelsForKey, _getDeep)
-        // espera parts[0] === key (path absoluto a partir de _store). Prefixa
-        // aqui, uma única vez, pra manter esse contrato em todos os callers.
-        // Se o path já vier absoluto (parts[0] === key), não duplica.
+    function _resolveModel(el, forcedKey) {
+        const { parts } = _parsePath(el.getAttribute('x-model'));
+        let key = forcedKey;
+        if (!key) {
+            const container = el.closest('[x-data],[proxy-target]');
+            if (!container) return { key: parts[0], parts: parts };
+            key = container.getAttribute('x-data') || container.getAttribute('proxy-target');
+        }
         const fullParts = parts[0] === key ? parts : [key].concat(parts);
-        return {
-            key,
-            parts: fullParts
-        };
+        return { key: key, parts: fullParts };
+    }
+
+    function _readModelValue(el) {
+        if (el.type === 'checkbox') return el.checked;
+        if (el.tagName === 'SELECT' && el.multiple) {
+            return Array.from(el.selectedOptions).map(function (o) { return o.value; });
+        }
+        if ((el.type === 'number' || el.type === 'range') && el.value !== '') {
+            const n = Number(el.value);
+            return isNaN(n) ? el.value : n;
+        }
+        return el.value;
+    }
+
+    function _applyModelValue(el, v) {
+        if (el.type === 'checkbox') {
+            el.checked = !!v;
+        } else if (el.type === 'radio') {
+            el.checked = (el.value === String(v));
+        } else if (el.tagName === 'SELECT' && el.multiple) {
+            const arr = Array.isArray(v) ? Array.prototype.map.call(v, String) : [];
+            Array.from(el.options).forEach(function (o) { o.selected = arr.indexOf(o.value) !== -1; });
+        } else {
+            const str = v == null ? '' : String(v);
+            if (el.value !== str) el.value = str;
+        }
     }
 
     function _syncModelsForKey(key) {
         const els = _modelRegistry.get(key);
         if (!els || !els.size) return;
         els.forEach(function (el) {
-            // Remove do registry se o elemento saiu do DOM
             if (!el.isConnected) { els.delete(el); return; }
-            const { parts } = _resolveModel(el);
-            const val = _getDeep(parts);
-            if (el.type === 'checkbox') {
-                el.checked = !!val;
-            } else if (el.type === 'radio') {
-                el.checked = (el.value === String(val));
-            } else if (el.tagName === 'TEXTAREA') {
-                const str = val == null ? '' : String(val);
-                if (el.value !== str) el.value = str;
-            } else {
-                const str = val == null ? '' : String(val);
-                if (el.value !== str) el.value = str;
-            }
+            const parts = _sGet(el, 'modelParts');
+            if (parts) _applyModelValue(el, _getDeep(parts));
         });
+    }
+
+    function _bindStoreModel(el, forcedKey) {
+        if (_sGet(el, 'model')) return;
+
+        const { key, parts } = _resolveModel(el, forcedKey);
+        if (_unsafePath(parts)) {
+            _reportError(ERROR_TYPES.MODEL_PATH, 'Caminho bloqueado no x-model', { path: parts.join('.'), element: _elementId(el) });
+            return;
+        }
+        _sSet(el, 'model', true);
+        _sSet(el, 'modelParts', parts);
+
+        if (!_store[parts[0]]) _store[parts[0]] = {};
+        if (!_proxies[parts[0]]) _proxies[parts[0]] = _makeProxy(_store[parts[0]], parts[0]);
+
+        const effect = _createEffect(function () {
+            let obj = _proxies[parts[0]];
+            for (let i = 1; i < parts.length - 1; i++) {
+                if (obj == null) return;
+                obj = obj[parts[i]];
+            }
+            const v = obj == null ? undefined : obj[parts[parts.length - 1]];
+            _applyModelValue(el, v);
+        });
+        effect.key = key;
+        _sSet(el, 'modelEffect', effect);
+        effect.run();
+
+        _modelRegistryAdd(key, el);
+
+        function _onInput() { _setDeep(parts, _readModelValue(el)); }
+
+        _sSet(el, 'modelHandler', _onInput);
+        el.addEventListener('input', _onInput);
+        el.addEventListener('change', _onInput);
     }
 
     function _initModels(root) {
-        var _root = (root && root.nodeType === Node.ELEMENT_NODE) ? root : document;
+        const _root = (root && root.nodeType === Node.ELEMENT_NODE) ? root : document;
         _root.querySelectorAll('[x-model]').forEach(function (el) {
-            if (_sGet(el, 'model')) return;
-            _sSet(el, 'model', true);
-
-            const {
-                key,
-                parts
-            } = _resolveModel(el);
-
-            if (!_store[parts[0]]) _store[parts[0]] = {};
-            if (!_proxies[parts[0]]) _proxies[parts[0]] = _makeProxy(_store[parts[0]], parts[0]);
-
-            const effect = _createEffect(function () {
-                let obj = _proxies[parts[0]];
-                for (let i = 1; i < parts.length - 1; i++) {
-                    if (obj == null) return;
-                    obj = obj[parts[i]];
-                }
-                const v = obj == null ? undefined : obj[parts[parts.length - 1]];
-
-                if (el.type === 'checkbox') {
-                    el.checked = !!v;
-                } else if (el.type === 'radio') {
-                    el.checked = (el.value === String(v));
-                } else if (el.tagName === 'TEXTAREA') {
-                    const str = v == null ? '' : String(v);
-                    if (el.value !== str) el.value = str;
-                } else {
-                    const str = v == null ? '' : String(v);
-                    if (el.value !== str) el.value = str;
-                }
-            });
-            effect.key = key;
-            _sSet(el, 'modelEffect', effect);
-            effect.run();
-
-            _modelRegistryAdd(key, el);
-
-            function _onInput() {
-                const v = el.type === 'checkbox' ? el.checked : el.value;
-                _setDeep(parts, v);
-            }
-
-            _sSet(el, 'modelHandler', _onInput);
-            el.addEventListener('input', _onInput);
-            el.addEventListener('change', _onInput);
+            if (_sGet(el, 'model') || _sGet(el, 'loopModel')) return;
+            if (el.closest('[x-for]')) return;   // dentro de x-for → _bindModelsInLoop
+            _bindStoreModel(el);
         });
     }
-    // ─── x-model dentro de x-for ────────────────────────────────────────────
-    // _resolveModel/_initModels resolvem x-model a partir do key do container
-    // [x-data], não do alias do loop (ex: "item.valor"). Por isso x-model
-    // dentro de x-for precisa de um bind próprio, direto no proxy do item
-    // (scope[alias]), que já é reativo e propaga pro array real.
+
+    // x-model dentro de x-for: alias do loop → bind direto no proxy do item;
+    // qualquer outro path → model normal do store (com a key do componente).
     function _bindModelsInLoop(root, scope, rootKey) {
         if (!root || root.nodeType !== Node.ELEMENT_NODE) return;
-        const els = root.hasAttribute('x-model')
-            ? [root, ...root.querySelectorAll('[x-model]')]
+        const candidates = root.hasAttribute('x-model')
+            ? [root].concat(Array.from(root.querySelectorAll('[x-model]')))
             : Array.from(root.querySelectorAll('[x-model]'));
 
-        els.forEach(function (el) {
-            const modelAttr = el.getAttribute('x-model');
-            const { parts } = _parsePath(modelAttr);
+        candidates.forEach(function (el) {
+            if (el !== root && _isScopedAway(el, root)) return;   // pertence a x-for/x-data aninhado
+
+            const { parts } = _parsePath(el.getAttribute('x-model'));
+            const locals = scope[_SCOPE_VARS] || [];
+
+            if (locals.indexOf(parts[0]) === -1) {
+                if (rootKey) _bindStoreModel(el, rootKey);
+                return;
+            }
+
             const aliasVal = scope[parts[0]];
-
-            // Não é um alias de loop (proxy de item) → deixa pro _initModels padrão
-            if (!aliasVal || typeof aliasVal !== 'object' || !aliasVal[_PROXY_SYM]) return;
-
             const subParts = parts.slice(1);
-            if (!subParts.length) return;
+            if (!aliasVal || typeof aliasVal !== 'object' || !aliasVal[_PROXY_SYM] || !subParts.length) return;
+            if (_unsafePath(subParts)) {
+                _reportError(ERROR_TYPES.MODEL_PATH, 'Caminho bloqueado no x-model', { path: parts.join('.'), element: _elementId(el) });
+                return;
+            }
 
             if (_sGet(el, 'loopModel')) {
-                // Reuso do nó: pode ser um item diferente agora — atualiza a
-                // referência do proxy e força re-sync do valor exibido.
                 _sSet(el, 'loopAlias', aliasVal);
                 const existingEffect = _sGet(el, 'loopModelEffect');
                 if (existingEffect) existingEffect.run();
@@ -1141,33 +1200,12 @@ var shadowProxy = (function () {
                 if (obj != null) obj[subParts[subParts.length - 1]] = v;
             }
 
-            const effect = _createEffect(function () {
-                const v = _getVal();
-                if (el.type === 'checkbox') {
-                    el.checked = !!v;
-                } else if (el.type === 'radio') {
-                    el.checked = (el.value === String(v));
-                } else if (el.tagName === 'TEXTAREA') {
-                    const str = v == null ? '' : String(v);
-                    if (el.value !== str) el.value = str;
-                } else {
-                    const str = v == null ? '' : String(v);
-                    if (el.value !== str) el.value = str;
-                }
-            });
+            const effect = _createEffect(function () { _applyModelValue(el, _getVal()); });
             effect.key = rootKey;
-            // Nota: usa uma key própria ('loopModelEffect'), separada do effect
-            // de render do nó ('effect') — a mesma classe de colisão corrigida
-            // no _initModels (CHANGELOG 2.7.5) também existia aqui, já que
-            // x-model dentro de um item que também carrega x-for/x-if no
-            // mesmo elemento sobrescrevia o effect de render.
             _sSet(el, 'loopModelEffect', effect);
             effect.run();
 
-            function _onInput() {
-                const v = el.type === 'checkbox' ? el.checked : el.value;
-                _setVal(v);
-            }
+            function _onInput() { _setVal(_readModelValue(el)); }
             _sSet(el, 'loopModelHandler', _onInput);
             el.addEventListener('input', _onInput);
             el.addEventListener('change', _onInput);
@@ -1176,85 +1214,81 @@ var shadowProxy = (function () {
 
     // ─── x-on ─────────────────────────────────────────────────────────────────
 
-    // _isInsideXFor: retorna true se o elemento está dentro de um x-for,
-    // excluindo o próprio root. Elementos dentro de x-for são bindados
-    // pelo _renderFor com o scope correto do loop — não devem ser rebindados aqui.
-    function _isInsideXFor(el, root) {
-        let ancestor = el.parentElement;
-        while (ancestor && ancestor !== root) {
-            if (ancestor.hasAttribute('x-for')) return true;
-            ancestor = ancestor.parentElement;
+    // true se o elemento pertence a outro x-for ou a outro x-data/proxy-target aninhado
+    // (excluindo o próprio root) — esses são tratados pelo seu próprio render.
+    function _isScopedAway(el, root) {
+        let a = el.parentElement;
+        while (a && a !== root) {
+            if (a.hasAttribute('x-for') || a.hasAttribute('x-data') || a.hasAttribute('proxy-target')) return true;
+            a = a.parentElement;
         }
         return false;
     }
 
     function _bindEvents(root, scope, key) {
-        const els = root.nodeType === Node.ELEMENT_NODE
-            ? [root, ...root.querySelectorAll('*')]
-            : [];
+        if (!root || root.nodeType !== Node.ELEMENT_NODE) return;
+        const els = [root].concat(Array.from(root.querySelectorAll('*')));
 
         els.forEach(function (el) {
             if (!el.attributes) return;
-            // Elementos dentro de x-for já foram bindados pelo _renderFor
-            if (el !== root && _isInsideXFor(el, root)) return;
-            for (let attr of el.attributes) {
-                if (!attr.name.startsWith('x-on:')) continue;
+            if (el !== root && _isScopedAway(el, root)) return;
+
+            Array.from(el.attributes).forEach(function (attr) {
+                if (!attr.name.startsWith('x-on:')) return;
                 const event = attr.name.slice(5);
                 const expr = attr.value;
                 const sKey = 'on_' + event;
+                const scopeKey = 'evScope_' + event;
 
-                // Já bindado com sucesso — não rebinda
-                if (_sGet(el, sKey)) continue;
+                // Já bindado — só atualiza o scope
+                if (_sGet(el, sKey)) {
+                    _sSet(el, scopeKey, scope);
+                    return;
+                }
 
-                // Monta scope de validação enriquecido com chaves do store vivo
-                // para que propriedades ainda não existentes no snapshot sejam aceitas
-                const liveData = key ? (_store[key] || {}) : {};
-                const validationScope = Object.assign({}, liveData, scope);
+                const validationKeys = new Set(_allKeys(scope));
+                if (key && _store[key]) Object.keys(_store[key]).forEach(function (k) { validationKeys.add(k); });
 
-                if (!_safeExpr(expr, validationScope)) {
+                if (!_safeExpr(expr, validationKeys)) {
                     if (_isBlockedExpr(expr)) {
-                        // Bloqueio definitivo — contém identificador proibido
                         _reportError(ERROR_TYPES.X_ON_UNSAFE, 'Expressão bloqueada por segurança no x-on', {
-                            expr    : expr,
-                            element : _elementId(el),
-                            attr    : attr.name,
+                            expr: expr,
+                            element: _elementId(el),
+                            attr: attr.name,
                         });
                     } else if (key) {
-                        // Prop ainda não existe no store — agenda retry
                         if (!_pendingBinds.has(key)) _pendingBinds.set(key, new Set());
-                        _pendingBinds.get(key).add({ el, scope, key });
+                        _pendingBinds.get(key).add({ el: el, scope: scope, key: key });
                     }
-                    continue;
+                    return;
                 }
+
+                _sSet(el, scopeKey, scope);
 
                 const handler = function (e) {
                     try {
-                        // Monta $s: objeto com getters/setters que delegam ao proxy vivo.
-                        // O interpreter resolve Identifier/MemberExpression contra $s
-                        // via get/set nativo do JS — os defineProperty abaixo roteiam
-                        // automaticamente pros setters reativos, sem reescrever a expressão.
+                        const curScope = _sGet(el, scopeKey) || scope;
                         const liveProxy = key ? (_proxies[key] || {}) : {};
+                        const locals = new Set(curScope[_SCOPE_VARS] || []);
                         const $s = Object.create(null);
 
-                        // Props do scope de loop/contexto
-                        Object.keys(scope).forEach(function (k) {
-                            const v = scope[k];
-                            if (v && typeof v === 'object' && v[_PROXY_SYM]) {
+                        // Variáveis do loop/contexto vencem o store; o resto vem do proxy vivo.
+                        _allKeys(curScope).forEach(function (k) {
+                            if (locals.has(k) || !(k in liveProxy)) {
                                 Object.defineProperty($s, k, {
                                     configurable: true, enumerable: true,
-                                    get() { return v; },
-                                    set(val) { /* items de loop: mutação direta via proxy */ v[k] = val; }
+                                    get() { return curScope[k]; },
+                                    set(val) { curScope[k] = val; }
                                 });
                             } else {
                                 Object.defineProperty($s, k, {
                                     configurable: true, enumerable: true,
-                                    get() { return liveProxy[k] !== undefined ? liveProxy[k] : v; },
-                                    set(val) { if (k in liveProxy) liveProxy[k] = val; }
+                                    get() { return liveProxy[k]; },
+                                    set(val) { liveProxy[k] = val; }
                                 });
                             }
                         });
 
-                        // Props do proxy vivo — cobertas no momento do clique (dinâmico)
                         Object.keys(liveProxy).forEach(function (k) {
                             if (k in $s) return;
                             Object.defineProperty($s, k, {
@@ -1264,17 +1298,13 @@ var shadowProxy = (function () {
                             });
                         });
 
-                        // Identificadores que são alvo de atribuição NOVA (ex: "out = ...")
-                        // e ainda não existem em liveProxy nem no scope. Sem isso, o
-                        // interpreter não os enxerga como propriedade de $s (Identifier
-                        // teria que existir em `scope`) e a atribuição falha em vez de
-                        // criar a prop no store.
+                        // Alvos de atribuição NOVA (ex: "out = ...")
                         const exprTokens = _tokenize(expr);
                         if (exprTokens) {
                             exprTokens.forEach(function (tok, i) {
                                 if (tok.type !== 'id' || tok.value in $s) return;
                                 const prevTok = exprTokens[i - 1];
-                                if (prevTok && prevTok.type === 'punc' && prevTok.value === '.') return;
+                                if (prevTok && ((prevTok.type === 'punc' && prevTok.value === '.') || (prevTok.type === 'op' && prevTok.value === '?.'))) return;
                                 const nextTok = exprTokens[i + 1];
                                 if (!(nextTok && nextTok.type === 'punc' && nextTok.value === '=')) return;
                                 const propName = tok.value;
@@ -1286,37 +1316,29 @@ var shadowProxy = (function () {
                             });
                         }
 
-                        // 'event' não é global fixo — é o Event do próprio disparo.
-                        // Injeta como prop comum do $s (interpreter resolve como
-                        // Identifier normal, sem precisar de tratamento especial).
                         if (!('event' in $s)) $s.event = e;
 
-                        const ast = _getAST(expr);
-                        new _Interpreter($s).run(ast);
+                        new _Interpreter($s, false).run(_getAST(expr));
                     } catch (err) {
                         const type = (err instanceof _SecurityError) ? ERROR_TYPES.SECURITY_BLOCKED : ERROR_TYPES.X_ON_UNSAFE;
                         _reportError(type, 'Erro ao executar x-on', {
-                            expr    : expr,
-                            element : _elementId(el),
-                            message : err.message,
+                            expr: expr,
+                            element: _elementId(el),
+                            message: err.message,
                         });
                     }
                 };
                 _sSet(el, sKey, handler);
                 el.addEventListener(event, handler);
-            }
+            });
         });
     }
 
     // ─── Render com tracking ──────────────────────────────────────────────────
-    //
-    // _renderTracked: cria ou reutiliza um Effect para o nó.
-    // Cada nó com diretiva reativa (x-bind, x-if, x-for) tem seu próprio Effect.
-    // Updates pontuais chegam direto ao Effect do nó — sem percorrer a lista.
 
     function _renderTracked(node, scope, key) {
         const existing = _sGet(node, 'effect');
-        if (existing) {
+        if (existing && !existing.dead) {
             existing.scope = scope;
             if (key) existing.key = key;
             existing.run();
@@ -1332,11 +1354,11 @@ var shadowProxy = (function () {
         effect.run();
     }
 
-    // _renderNodeRaw: executa o render dentro do Effect ativo.
+    const _SKIP_ATTRS = /^(x-bind|x-if|x-for|x-model|x-on:|x-ref|x-key|x-static|x-cloak|x-data)/;
+
     function _renderNodeRaw(node, scope, componentKey) {
         if (node.nodeType === Node.TEXT_NODE) return;
 
-        // Herda componentKey do effect do próprio nó, se disponível
         const _nodeEffect = _sGet(node, 'effect');
         const ck = componentKey || (_nodeEffect && _nodeEffect.key) || null;
 
@@ -1360,23 +1382,58 @@ var shadowProxy = (function () {
         }
 
         if (node.attributes) {
-            const _SKIP_ATTRS = /^(x-bind|x-if|x-for|x-model|x-on:|x-ref|x-key)/;
             let attrTpl = _sGet(node, 'attrTpl');
-            if (!attrTpl) attrTpl = _sSet(node, 'attrTpl', {});
-            for (let i = 0; i < node.attributes.length; i++) {
-                const attr = node.attributes[i];
-                if (_SKIP_ATTRS.test(attr.name)) continue;
+            if (!attrTpl) attrTpl = _sSet(node, 'attrTpl', Object.create(null));
 
-                // Guarda o template ORIGINAL na primeira vez que o atributo é visto —
-                // sem isso, setAttribute() abaixo sobrescreve "{expr}" pelo valor já
-                // interpolado, e a próxima render não encontra mais o '{' pra reinterpolar.
-                if (!(attr.name in attrTpl)) {
-                    if (!attr.value.includes('{')) continue;
-                    attrTpl[attr.name] = attr.value;
+            // 1) registra templates ORIGINAIS na primeira vez que o atributo é visto
+            Array.from(node.attributes).forEach(function (attr) {
+                if (_SKIP_ATTRS.test(attr.name) || (attr.name in attrTpl)) return;
+                if (attr.value.indexOf('{') === -1) return;
+
+                if (/^on/i.test(attr.name) || attr.name.toLowerCase() === 'srcdoc') {
+                    attrTpl[attr.name] = null;
+                    _reportError(ERROR_TYPES.SECURITY_BLOCKED, 'Interpolação em atributo bloqueada', {
+                        element: _elementId(node),
+                        attr: attr.name,
+                    });
+                    return;
+                }
+                attrTpl[attr.name] = attr.value;
+            });
+
+            // 2) avalia a partir dos templates (atributos booleanos removidos continuam sendo reavaliados)
+            Object.keys(attrTpl).forEach(function (name) {
+                const tpl = attrTpl[name];
+                if (tpl === null) return;
+                const lname = name.toLowerCase();
+
+                const single = _BOOL_ATTRS.has(lname) ? tpl.match(/^\s*\{([^{}]+)\}\s*$/) : null;
+                if (single) {
+                    const v = _evalExpr(single[1].trim(), scope, ck);
+                    const on = !!v && v !== 'false';
+                    if (on) { if (node.getAttribute(name) !== '') node.setAttribute(name, ''); }
+                    else node.removeAttribute(name);
+                    const prop = _BOOL_PROPS[lname] || lname;
+                    try { if (prop in node) node[prop] = on; } catch (e) { /* ignore */ }
+                    return;
                 }
 
-                node.setAttribute(attr.name, _interpolate(attrTpl[attr.name], scope, ck));
-            }
+                let value = _interpolate(tpl, scope, ck);
+
+                if (_URL_ATTRS.has(lname) && _isUnsafeUrl(value)) {
+                    _reportError(ERROR_TYPES.SECURITY_BLOCKED, 'URL insegura bloqueada em atributo', {
+                        element: _elementId(node),
+                        attr: name,
+                        value: value,
+                    });
+                    value = 'about:blank';
+                }
+
+                if (node.getAttribute(name) !== value) node.setAttribute(name, value);
+                if (lname === 'value' && 'value' in node && node.value !== value) {
+                    try { node.value = value; } catch (e) { /* ignore */ }
+                }
+            });
         }
 
         if (xFor != null) {
@@ -1385,12 +1442,14 @@ var shadowProxy = (function () {
         }
 
         for (let child of node.children) {
+            // x-data / proxy-target aninhado é renderizado pelo próprio componente
+            if (child.hasAttribute('x-data') || child.hasAttribute('proxy-target')) continue;
+
             const hasDirective = child.hasAttribute('x-bind') ||
                 child.hasAttribute('x-if') ||
                 child.hasAttribute('x-for');
 
             if (hasDirective) {
-                // Sobe na árvore para encontrar o rootKey mais próximo
                 let rootKey = ck;
                 if (!rootKey) {
                     let ancestor = node;
@@ -1410,27 +1469,67 @@ var shadowProxy = (function () {
         }
     }
 
-    // ─── x-key / __nid ────────────────────────────────────────────────────────
-
+    // ─── x-key / nid ──────────────────────────────────────────────────────────
     let _nidCounter = 0;
+    const _nids = new WeakMap();
 
     function _getItemKey(item, xKeyExpr, scope) {
         if (xKeyExpr) {
             const val = _evalExpr(xKeyExpr, scope);
             if (val != null) return String(val);
         }
-        if (!item.__nid) item.__nid = 'nid_' + (++_nidCounter);
-        return item.__nid;
+        if (item === null || typeof item !== 'object') return 'prim_' + String(item);
+        const raw = item[_PROXY_SYM] ? item.__raw : item;
+        let nid = _nids.get(raw);
+        if (!nid) {
+            nid = 'nid_' + (++_nidCounter);
+            _nids.set(raw, nid);
+        }
+        return nid;
     }
 
     // ─── x-for ────────────────────────────────────────────────────────────────
 
+    const _WRAPPER_MAP = {
+        SELECT: 'select',
+        TBODY: 'tbody',
+        THEAD: 'thead',
+        TFOOT: 'tfoot',
+        TR: 'tr',
+        UL: 'ul',
+        OL: 'ol',
+        DL: 'dl',
+    };
+    const _SVG_NS = 'http://www.w3.org/2000/svg';
+
+    function _createWrapper(node) {
+        if (node.namespaceURI === _SVG_NS) return document.createElementNS(_SVG_NS, 'g');
+        return document.createElement(_WRAPPER_MAP[node.tagName] || 'div');
+    }
+
+    const _ID = '[\\p{L}_$][\\p{L}\\p{N}_$]*';
+    const _FOR_AS = new RegExp('^\\s*(' + _ID + ')\\s+in\\s+(.+?)\\s+as\\s+(' + _ID + ')\\s*$', 'u');
+    const _FOR_COMMA = new RegExp('^\\s*(' + _ID + ')\\s*,\\s*(' + _ID + ')\\s+in\\s+(.+)\\s*$', 'u');
+    const _FOR_PLAIN = new RegExp('^\\s*(' + _ID + ')\\s+in\\s+(.+)\\s*$', 'u');
+
+    // Sentinelas por componente: um x-for com expressão inválida não lê nada do
+    // store, então não tem nenhuma dep real e nunca mais rodaria. Ele assina aqui e
+    // _scheduleApply(key) o reagenda a cada atribuição no componente, reportando o
+    // erro de novo (onError) sem travar os irmãos.
+    const _forErrDeps = Object.create(null);
+
+    function _forErrDep(key) {
+        if (!key) return;
+        if (!_forErrDeps[key]) _forErrDeps[key] = {};
+        _track(_forErrDeps[key], 'v');
+    }
+
     function _renderFor(node, parentScope, expr) {
         let alias, indexAlias, listExp;
 
-        const matchAs = expr.match(/^\s*(\w+)\s+in\s+(.+?)\s+as\s+(\w+)\s*$/);
-        const matchComma = expr.match(/^\s*(\w+)\s*,\s*(\w+)\s+in\s+(.+)\s*$/);
-        const matchPlain = expr.match(/^\s*(\w+)\s+in\s+(.+)\s*$/);
+        const matchAs = expr.match(_FOR_AS);
+        const matchComma = expr.match(_FOR_COMMA);
+        const matchPlain = expr.match(_FOR_PLAIN);
 
         if (matchAs) {
             alias = matchAs[1]; listExp = matchAs[2].trim(); indexAlias = matchAs[3];
@@ -1439,131 +1538,137 @@ var shadowProxy = (function () {
         } else if (matchPlain) {
             alias = matchPlain[1]; listExp = matchPlain[2].trim(); indexAlias = null;
         } else {
+            const pe = _sGet(node, 'effect');
+            _forErrDep(pe && pe.key);
             _reportError(ERROR_TYPES.X_FOR_SYNTAX, 'Expressão inválida no x-for', {
-                expr    : expr,
-                element : _elementId(node),
-                path    : _sGet(node, 'effect')?.key || 'unknown',
+                expr: expr,
+                element: _elementId(node),
+                path: (pe && pe.key) || 'unknown',
             });
             return;
         }
 
         const list = _evalExpr(listExp, parentScope);
         const xKeyExpr = node.getAttribute('x-key') || null;
+
+        if (_sGet(node, 'template') == null) _cacheNode(node);
         const template = _sGet(node, 'template');
+        const statics = _sGet(node, 'statics') || { lead: [], trail: [] };
         const templateHasModel = !!template && template.indexOf('x-model') !== -1;
 
-        const parentEffect = _sGet(node, 'effect');
-        const rootKey = parentEffect ? parentEffect.key : null;
-
-        const rootEl = rootKey
-            ? document.querySelector('[x-data="' + CSS.escape(rootKey) + '"]')
-            : null;
-
+        // ── Lista vazia: destrói nós (effects + listeners), preserva x-static ──
         if (!Array.isArray(list) || list.length === 0) {
             (_sGet(node, 'groups') || []).forEach(function (g) {
-                g.nodes.forEach(function (el) {
-                    const elEffect = _sGet(el, 'effect');
-                    if (elEffect) elEffect.cleanup();
-                });
+                g.nodes.forEach(_destroyNode);
             });
-            node.innerHTML = '';
+            Array.from(node.children).forEach(function (c) {
+                if (!_sGet(c, 'static')) c.remove();
+            });
             _sSet(node, 'keys', []);
             _sSet(node, 'groups', []);
             return;
         }
 
-        const existingByKey = {};
+        const parentEffect = _sGet(node, 'effect');
+        const rootKey = parentEffect ? parentEffect.key : null;
+
+        const rootEl = rootKey
+            ? document.querySelector(
+                '[x-data="' + CSS.escape(rootKey) + '"], [proxy-target="' + CSS.escape(rootKey) + '"]'
+            )
+            : null;
+
+        const existingByKey = Object.create(null);
         const prevGroups = _sGet(node, 'groups') || [];
         const currentKeys = prevGroups.map(function (g) { return g.key; });
-
-        prevGroups.forEach(function (g) {
-            existingByKey[g.key] = g.nodes;
-        });
+        prevGroups.forEach(function (g) { existingByKey[g.key] = g.nodes; });
 
         const newKeys = [];
         const newNodes = [];
         const newScopes = [];
         const newThis = [];
         const newNodeGroups = [];
+        const newChanged = [];
+        const seenKeys = new Set();
 
         list.forEach(function (item, index) {
-            const rawItem = (item && item[_PROXY_SYM]) ? item : _makeProxy(
-                (item && item.__raw) ? item.__raw : item,
-                rootKey || ''
-            );
-            const itemWithIndex = new Proxy(rawItem, {
-                get(target, prop, receiver) {
-                    if (prop === '$i' || prop === '$index') return index;
-                    return Reflect.get(target, prop, receiver);
-                }
-            });
+            // Só Array/objeto literal vira proxy; primitivos, Date, Map, Set... usados direto
+            const isObj = item !== null && typeof item === 'object';
+            let itemWithIndex = item;
+            if (isObj && (item[_PROXY_SYM] || _isProxyable(item))) {
+                const rawItem = item[_PROXY_SYM] ? item : _makeProxy(item, rootKey || '');
+                itemWithIndex = new Proxy(rawItem, {
+                    get(target, prop, receiver) {
+                        if (prop === '$i' || prop === '$index') return index;
+                        return Reflect.get(target, prop, receiver);
+                    }
+                });
+            }
 
             const parentThis = parentScope.$this || null;
-            const itemThis = {
-                index: index,
-                dom: null,
-                data: item,
-                parent: parentThis
-            };
+            const itemThis = { index: index, dom: null, data: item, parent: parentThis };
 
-            const scope = Object.assign({}, parentScope, {
-                [alias]: itemWithIndex,
-                $i: index,
-                $index: index,
-                $this: itemThis
+            // Scope por prototype: herda o store e o scope do loop pai
+            const own = {};
+            own[alias] = itemWithIndex;
+            own.$i = index;
+            own.$index = index;
+            own.$this = itemThis;
+            if (indexAlias) own[indexAlias] = index;
+
+            const scope = Object.create(parentScope);
+            Object.keys(own).forEach(function (k) {
+                Object.defineProperty(scope, k, { value: own[k], writable: true, enumerable: true, configurable: true });
             });
-            if (indexAlias) scope[indexAlias] = index;
+            Object.defineProperty(scope, _SCOPE_VARS, {
+                value: (parentScope[_SCOPE_VARS] || []).concat(Object.keys(own)),
+                writable: true, enumerable: false, configurable: true
+            });
 
-            const key = _getItemKey(item, xKeyExpr, scope);
+            const rawRef = isObj ? (item[_PROXY_SYM] ? item.__raw : item) : item;
+            const baseKey = _getItemKey(item, xKeyExpr, scope);
+            let key = baseKey;
+            let dupCount = 1;
+            while (seenKeys.has(key)) key = baseKey + '__' + (++dupCount);
+            seenKeys.add(key);
+
             newKeys.push(key);
             newScopes.push(scope);
             newThis.push(itemThis);
 
             if (existingByKey[key]) {
                 const groupNodes = existingByKey[key];
+                let changed = false;
                 groupNodes.forEach(function (existingEl) {
-                    [existingEl, ...existingEl.querySelectorAll('*')].forEach(el => {
-                        if (!el.attributes) return;
-                        for (let attr of el.attributes) {
-                            if (!attr.name.startsWith('x-on:')) continue;
-                            const event = attr.name.slice(5);
-                            const sKey = 'on_' + event;
-                            const handler = _sGet(el, sKey);
-                            if (handler) {
-                                el.removeEventListener(event, handler);
-                                _sDelete(el, sKey);
-                            }
-                        }
-                    });
-                    _renderTracked(existingEl, scope, rootKey);
+                    const eff = _sGet(existingEl, 'effect');
+                    if (eff && !eff.dead && _sGet(existingEl, 'forIndex') === index && _sGet(existingEl, 'forItem') === rawRef) {
+                        // Inalterado: o effect do nó já rastreia suas deps — só atualiza o scope
+                        eff.scope = scope;
+                        if (rootKey) eff.key = rootKey;
+                    } else {
+                        _renderTracked(existingEl, scope, rootKey);
+                        _sSet(existingEl, 'forIndex', index);
+                        _sSet(existingEl, 'forItem', rawRef);
+                        changed = true;
+                    }
                 });
-                newNodes.push(...groupNodes);
+                newNodes.push.apply(newNodes, groupNodes);
                 newNodeGroups.push(groupNodes);
+                newChanged.push(changed);
             } else {
-                const _WRAPPER_MAP = {
-                    SELECT  : 'select',
-                    TBODY   : 'tbody',
-                    THEAD   : 'thead',
-                    TFOOT   : 'tfoot',
-                    TR      : 'tr',
-                    UL      : 'ul',
-                    OL      : 'ol',
-                    DL      : 'dl',
-                };
-                const wrapper = document.createElement(_WRAPPER_MAP[node.tagName] || 'div');
+                const wrapper = _createWrapper(node);
                 wrapper.innerHTML = template;
                 _cacheTemplates(wrapper);
                 const children = Array.from(wrapper.children);
 
-                if (children.length === 1) {
-                    _renderTracked(children[0], scope, rootKey);
-                    newNodes.push(children[0]);
-                    newNodeGroups.push([children[0]]);
-                } else {
-                    children.forEach(c => _renderTracked(c, scope, rootKey));
-                    newNodes.push(...children);
-                    newNodeGroups.push(children);
-                }
+                children.forEach(function (c) {
+                    _renderTracked(c, scope, rootKey);
+                    _sSet(c, 'forIndex', index);
+                    _sSet(c, 'forItem', rawRef);
+                });
+                newNodes.push.apply(newNodes, children);
+                newNodeGroups.push(children);
+                newChanged.push(true);
             }
         });
 
@@ -1572,27 +1677,26 @@ var shadowProxy = (function () {
         currentKeys.forEach(function (key) {
             if (!newKeySet.has(key) && existingByKey[key]) {
                 existingByKey[key].forEach(function (el) {
-                    const elEffect = _sGet(el, 'effect');
-                    if (elEffect) elEffect.cleanup();
+                    _destroyNode(el);
                     el.remove();
                 });
             }
         });
 
-        // ── Remove filhos extras não rastreados ───────────────────────────────
+        // ── Remove filhos extras não rastreados (preserva x-static) ───────────
         const newNodeSet = new Set(newNodes);
         Array.from(node.children).forEach(function (child) {
-            if (!newNodeSet.has(child)) child.remove();
+            if (!newNodeSet.has(child) && !_sGet(child, 'static')) child.remove();
         });
 
-        // ── Insere/reordena via DocumentFragment — único reflow para novos e reordenados ──
-        const needsReorder = newNodes.some(function (el, i) {
-            return node.children[i] !== el;
-        });
+        // ── Insere/reordena (statics iniciais + itens + statics finais) ───────
+        const expected = statics.lead.concat(newNodes, statics.trail);
+        const needsReorder = expected.length !== node.children.length ||
+            expected.some(function (el, i) { return node.children[i] !== el; });
 
         if (needsReorder) {
             const frag = document.createDocumentFragment();
-            newNodes.forEach(function (el) { frag.appendChild(el); });
+            expected.forEach(function (el) { frag.appendChild(el); });
             node.appendChild(frag);
         }
 
@@ -1601,7 +1705,7 @@ var shadowProxy = (function () {
             return { key: key, nodes: newNodeGroups[i] };
         }));
 
-        // ── Preenche $this.dom e bind eventos ─────────────────────────────────
+        // ── $this.dom e bind de eventos / models (só itens novos ou movidos) ──
         const $ref = {};
         if (rootEl) {
             rootEl.querySelectorAll('[x-ref]').forEach(function (refEl) {
@@ -1609,22 +1713,20 @@ var shadowProxy = (function () {
             });
         }
 
+        const $emit = function (name, detail) {
+            if (!rootEl) return;
+            rootEl.dispatchEvent(new CustomEvent(name, { bubbles: true, detail: detail || {} }));
+        };
+
         newNodeGroups.forEach(function (nodes, i) {
-            if (!newThis[i]) return;
+            if (!newChanged[i]) return;
             newThis[i].dom = nodes[0] || null;
 
-            const $emit = function (name, detail) {
-                if (!rootEl) return;
-                rootEl.dispatchEvent(new CustomEvent(name, {
-                    bubbles: true,
-                    detail: detail || {}
-                }));
-            };
-
-            const enrichedScope = Object.assign({}, newScopes[i], {
-                $root: rootEl,
-                $ref: $ref,
-                $emit: $emit
+            const enrichedScope = Object.create(newScopes[i]);
+            Object.defineProperties(enrichedScope, {
+                $root: { value: rootEl, writable: true, enumerable: true, configurable: true },
+                $ref: { value: $ref, writable: true, enumerable: true, configurable: true },
+                $emit: { value: $emit, writable: true, enumerable: true, configurable: true }
             });
 
             nodes.forEach(function (el) {
@@ -1636,12 +1738,41 @@ var shadowProxy = (function () {
         });
     }
 
+
     // ─── Template cache ───────────────────────────────────────────────────────
+    // Filhos com x-static ficam fora do template e são preservados pelo x-for.
+
+    function _cacheNode(el) {
+        if (_sGet(el, 'template') != null) return;
+
+        const lead = [], trail = [];
+        let seenItem = false;
+        Array.from(el.children).forEach(function (c) {
+            if (c.hasAttribute('x-static')) {
+                _sSet(c, 'static', true);
+                (seenItem ? trail : lead).push(c);
+            } else {
+                seenItem = true;
+            }
+        });
+
+        let tpl;
+        if (lead.length || trail.length) {
+            const clone = el.cloneNode(true);
+            Array.from(clone.children).forEach(function (c) {
+                if (c.hasAttribute('x-static')) c.remove();
+            });
+            tpl = clone.innerHTML;
+        } else {
+            tpl = el.innerHTML;
+        }
+
+        _sSet(el, 'statics', { lead: lead, trail: trail });
+        _sSet(el, 'template', tpl);
+    }
 
     function _cacheTemplates(root) {
-        root.querySelectorAll('[x-for]').forEach(function (el) {
-            if (!_sGet(el, 'template')) _sSet(el, 'template', el.innerHTML);
-        });
+        root.querySelectorAll('[x-for]').forEach(_cacheNode);
     }
 
     // ─── Apply ────────────────────────────────────────────────────────────────
@@ -1649,7 +1780,7 @@ var shadowProxy = (function () {
     function _applyTarget(key, doRender) {
         if (doRender === undefined) doRender = true;
         const targets = document.querySelectorAll(
-            '[proxy-target="' + key + '"], [x-data="' + key + '"]'
+            '[proxy-target="' + CSS.escape(key) + '"], [x-data="' + CSS.escape(key) + '"]'
         );
 
         if (!targets.length) return;
@@ -1663,6 +1794,7 @@ var shadowProxy = (function () {
             }
             target.dispatchEvent(new CustomEvent('before-render', { bubbles: false }));
 
+            if (target.hasAttribute('x-for')) _cacheNode(target);
             _cacheTemplates(target);
 
             const $ref = {};
@@ -1673,43 +1805,29 @@ var shadowProxy = (function () {
                 target.dispatchEvent(new CustomEvent(name, { bubbles: true, detail: detail || {} }));
             };
 
-        const baseScope = target.hasAttribute('x-data')
-            ? (_proxies[key] || data)   // ✅ usa o proxy para rastrear dependências
-            : { [key]: data };
+            const liveData = _proxies[key] || data;
+            const baseScope = target.hasAttribute('x-data')
+                ? liveData
+                : { [key]: liveData };
 
-            // ✅ nunca escreve na proxy reativa. Object.create(baseScope) mantém baseScope
-            // na prototype chain — assim scope.nome cai no get trap do Proxy de verdade e
-            // RASTREIA a dependência (_track). Só não dá pra usar Object.assign(scope,{...})
-            // pra adicionar $root/$ref/etc: como scope não tem essas props OWN, o [[Set]]
-            // padrão do JS delega pro [[Set]] do prototype — e como o prototype é um Proxy,
-            // isso disparava o SET TRAP DO STORE a cada render (escrevendo $root/$ref/$emit
-            // dentro do próprio hero.*), causando _scheduleApply -> render -> set -> loop
-            // infinito. Object.defineProperty cria a prop OWN direto, sem consultar/disparar
-            // o prototype — sem esse problema.
+            // Props OWN via defineProperties — nunca passam pelo set trap do proxy (evita loop de render).
             const scope = Object.create(baseScope);
             Object.defineProperties(scope, {
-                $root:  { value: target, writable: true, enumerable: true, configurable: true },
-                $ref:   { value: $ref, writable: true, enumerable: true, configurable: true },
-                $emit:  { value: $emit, writable: true, enumerable: true, configurable: true },
-                $i:     { value: undefined, writable: true, enumerable: true, configurable: true },
+                $root: { value: target, writable: true, enumerable: true, configurable: true },
+                $ref: { value: $ref, writable: true, enumerable: true, configurable: true },
+                $emit: { value: $emit, writable: true, enumerable: true, configurable: true },
+                $i: { value: undefined, writable: true, enumerable: true, configurable: true },
                 $index: { value: undefined, writable: true, enumerable: true, configurable: true },
-                $this:  { value: null, writable: true, enumerable: true, configurable: true }
+                $this: { value: null, writable: true, enumerable: true, configurable: true }
             });
 
-            // Cascade completo (_renderNodeRaw a partir da raiz) só quando NINGUÉM
-            // tratou a mutação granularmente (_trigger não achou effect). Update pontual
-            // já foi resolvido pelo effect do próprio nó — evita retocar a árvore inteira.
             if (doRender) {
                 _renderTracked(target, scope, key);
             }
 
-            // removeu o _bindEvents daqui
-
             Promise.resolve().then(function () {
-                // ✅ FIX: binda x-on apenas em elementos fora do x-for
                 _bindEvents(target, scope, key);
 
-                // Retry de binds pendentes — após o bind normal, store já populado
                 if (_pendingBinds.has(key)) {
                     const pending = _pendingBinds.get(key);
                     _pendingBinds.delete(key);
@@ -1717,6 +1835,10 @@ var shadowProxy = (function () {
                         _bindEvents(p.el, p.scope, p.key);
                     });
                 }
+
+                // x-cloak: some após o 1º render
+                if (target.hasAttribute('x-cloak')) target.removeAttribute('x-cloak');
+                target.querySelectorAll('[x-cloak]').forEach(function (el) { el.removeAttribute('x-cloak'); });
 
                 if (typeof data.$afterRender === 'function') {
                     try { data.$afterRender(target); } catch (e) { _reportError(ERROR_TYPES.LIFECYCLE, '$afterRender threw', { message: e.message, component: key }); }
@@ -1730,10 +1852,6 @@ var shadowProxy = (function () {
 
     // ─── Proxy factory ────────────────────────────────────────────────────────
 
-    // _nestedProxyCache: WeakMap<rawObj, Map<cacheKey, proxy>>
-    // cacheKey = key + '\0' + path — garante que o mesmo raw object usado em
-    // componentes ou caminhos diferentes recebe proxies independentes,
-    // com setters que disparam o key/path correto.
     const _nestedProxyCache = new WeakMap();
 
     function _getNestedProxy(raw, key, path) {
@@ -1753,58 +1871,74 @@ var shadowProxy = (function () {
                 if (prop === _PROXY_SYM) return true;
                 if (prop === '__raw') return target;
 
-                if (typeof prop === 'string' && prop !== '__nid') {
-                    _track(target, prop);
-                }
+                if (typeof prop === 'string') _track(target, prop);
 
                 const val = Reflect.get(target, prop, receiver);
-                if (val !== null && typeof val === 'object' && !val[_PROXY_SYM]) {
-                    return _getNestedProxy(val, key, basePath + '.' + prop);
+                if (val !== null && typeof val === 'object' && !val[_PROXY_SYM] && _isProxyable(val)) {
+                    // Invariante do Proxy: prop não-configurável e não-gravável (frozen) deve devolver o valor real
+                    if (!Object.isExtensible(target)) {
+                        const d = Object.getOwnPropertyDescriptor(target, prop);
+                        if (d && !d.configurable && !d.writable) return val;
+                    }
+                    return _getNestedProxy(val, key, basePath + '.' + String(prop));
                 }
                 return val;
             },
 
             set(target, prop, value) {
+                // Unwrap: nunca grava proxy dentro do raw (sort/reverse/splice leem via proxy e regravam)
+                if (value && typeof value === 'object' && value[_PROXY_SYM]) value = value.__raw;
+
+                // Hooks de lifecycle não disparam render
+                if (typeof prop === 'string' && _HOOKS.has(prop)) { target[prop] = value; return true; }
+
                 const oldVal = target[prop];
                 if (oldVal === value) return true;
 
-                if (prop === '__nid') { target[prop] = value; return true; }
-
-                // Captura snapshots ancestrais ANTES da mutação
-                const ancestorSnapshots = _snapshotAncestors(basePath + '.' + prop);
+                const path = basePath + '.' + String(prop);
+                const ancestorSnapshots = _snapshotAncestors(path);
+                const isArr = Array.isArray(target);
+                const oldLen = isArr ? target.length : 0;
 
                 target[prop] = value;
 
-                _notifyWatchers(basePath + '.' + prop, value, oldVal, ancestorSnapshots);
+                _notifyWatchers(path, value, oldVal, ancestorSnapshots);
 
-                // Se já existe effect granular tracking esse (target, prop), o _trigger
-                // já agenda exatamente o nó certo — não precisa do _applyTarget completo.
-                // _scheduleApply só entra como fallback quando ninguém tracka essa prop
-                // ainda (ex: novo índice de array via push, prop nova sem effect prévio).
-                const handled = _trigger(target, prop);
+                // _scheduleApply ANTES do _trigger: $beforeRender roda antes dos effects granulares
+                const handled = _hasEffects(target, prop);
                 _scheduleApply(key, !handled);
+                _trigger(target, prop);
+                // push/índice novo: length muda sozinho e o set de 'length' sai cedo (oldVal === value)
+                if (isArr && prop !== 'length' && target.length !== oldLen) _trigger(target, 'length');
 
                 return true;
             },
 
             deleteProperty(target, prop) {
+                if (!Object.prototype.hasOwnProperty.call(target, prop)) return true;
+
+                const path = basePath + '.' + String(prop);
                 const oldVal = target[prop];
+                const ancestorSnapshots = _snapshotAncestors(path);
+
                 delete target[prop];
-                _notifyWatchers(basePath + '.' + prop, undefined, oldVal);
-                const handled = _trigger(target, prop);
+
+                _notifyWatchers(path, undefined, oldVal, ancestorSnapshots);
+                const handled = _hasEffects(target, prop);
                 _scheduleApply(key, !handled);
+                _trigger(target, prop);
                 return true;
             }
         });
     }
+
     // ─── Destroy helpers ──────────────────────────────────────────────────────
 
     function _destroyNode(node) {
         if (!node || node.nodeType !== Node.ELEMENT_NODE) return;
 
-        // Remove x-on listeners
         if (node.attributes) {
-            for (let attr of node.attributes) {
+            for (let attr of Array.from(node.attributes)) {
                 if (!attr.name.startsWith('x-on:')) continue;
                 const event = attr.name.slice(5);
                 const key = 'on_' + event;
@@ -1813,17 +1947,16 @@ var shadowProxy = (function () {
                     node.removeEventListener(event, handler);
                     _sDelete(node, key);
                 }
+                _sDelete(node, 'evScope_' + event);
             }
         }
 
-        // Cleanup effect granular
         const nodeEffect = _sGet(node, 'effect');
         if (nodeEffect) {
-            nodeEffect.cleanup();
+            nodeEffect.kill();
             _sDelete(node, 'effect');
         }
 
-        // Remove x-model listeners (input/change)
         if (_sGet(node, 'model')) {
             const modelHandler = _sGet(node, 'modelHandler');
             if (modelHandler) {
@@ -1833,13 +1966,13 @@ var shadowProxy = (function () {
             }
             const modelEffect = _sGet(node, 'modelEffect');
             if (modelEffect) {
-                modelEffect.cleanup();
+                modelEffect.kill();
                 _sDelete(node, 'modelEffect');
             }
             _sDelete(node, 'model');
+            _sDelete(node, 'modelParts');
         }
 
-        // Remove x-model listeners de dentro de x-for
         if (_sGet(node, 'loopModel')) {
             const loopModelHandler = _sGet(node, 'loopModelHandler');
             if (loopModelHandler) {
@@ -1849,20 +1982,19 @@ var shadowProxy = (function () {
             }
             const loopModelEffect = _sGet(node, 'loopModelEffect');
             if (loopModelEffect) {
-                loopModelEffect.cleanup();
+                loopModelEffect.kill();
                 _sDelete(node, 'loopModelEffect');
             }
             _sDelete(node, 'loopModel');
             _sDelete(node, 'loopAlias');
         }
 
-        // Recursivo nos filhos
         Array.from(node.children).forEach(_destroyNode);
     }
 
     function _destroyKey(key) {
-        // Cancela renders pendentes do key antes de qualquer coisa
         _pendingKeys.delete(key);
+        _pendingKeysNeedRender.delete(key);
 
         const targets = document.querySelectorAll(
             '[proxy-target="' + CSS.escape(key) + '"], [x-data="' + CSS.escape(key) + '"]'
@@ -1871,226 +2003,68 @@ var shadowProxy = (function () {
         targets.forEach(function (target) {
             const data = _store[key] || {};
 
-            // ── $beforeDestroy ────────────────────────────────────────────────
             if (typeof data.$beforeDestroy === 'function') {
-                try {
-                    data.$beforeDestroy(target);
-                } catch (e) {
-                    _reportError(ERROR_TYPES.LIFECYCLE, '$beforeDestroy threw', {
-                        message: e.message,
-                        component: key
-                    });
+                try { data.$beforeDestroy(target); } catch (e) {
+                    _reportError(ERROR_TYPES.LIFECYCLE, '$beforeDestroy threw', { message: e.message, component: key });
                 }
             }
-            target.dispatchEvent(new CustomEvent('before-destroy', {
-                bubbles: false
-            }));
+            target.dispatchEvent(new CustomEvent('before-destroy', { bubbles: false }));
 
-            // ── Destroy recursivo nos filhos ──────────────────────────────────
             Array.from(target.children).forEach(_destroyNode);
 
-            // ── Limpa o próprio target ────────────────────────────────────────
             const targetEffect = _sGet(target, 'effect');
             if (targetEffect) {
-                targetEffect.cleanup();
+                targetEffect.kill();
                 _sDelete(target, 'effect');
             }
             _sDelete(target, 'keys');
 
-            // ── $afterDestroy ─────────────────────────────────────────────────
             if (typeof data.$afterDestroy === 'function') {
-                try {
-                    data.$afterDestroy(target);
-                } catch (e) {
-                    _reportError(ERROR_TYPES.LIFECYCLE, '$afterDestroy threw', {
-                        message: e.message,
-                        component: key
-                    });
+                try { data.$afterDestroy(target); } catch (e) {
+                    _reportError(ERROR_TYPES.LIFECYCLE, '$afterDestroy threw', { message: e.message, component: key });
                 }
             }
-            target.dispatchEvent(new CustomEvent('after-destroy', {
-                bubbles: false
-            }));
+            target.dispatchEvent(new CustomEvent('after-destroy', { bubbles: false }));
         });
 
-        // Limpa store e proxy do key (isso já basta — o getter de shadowProxy.template
-        // recria vazio se alguém acessar depois, não precisa de limpeza extra aqui)
         delete _store[key];
         delete _proxies[key];
 
-        // Remove watchers cujo path começa com esse key
         Object.keys(_watchers).forEach(function (path) {
-            if (path === key || path.startsWith(key + '.')) {
-                delete _watchers[path];
-            }
+            if (path === key || path.startsWith(key + '.')) delete _watchers[path];
         });
 
-        // Limpa model registry do key
         _modelRegistryRemove(key);
-
-        // Limpa pending binds do key
         _pendingBinds.delete(key);
-
-        // Limpa cache de expressões compiladas do key
-        _purgeExprCache(key);
     }
 
     // ─── Public API ───────────────────────────────────────────────────────────
-
-    /**
-     * @namespace proxy
-     * @description
-     * shadow-proxy — Reactive DOM binding via Recursive Proxy.
-     *
-     * Uso básico:
-     * ```html
-     * <div x-data="meuComponente">
-     *   <span x-bind="titulo"></span>
-     * </div>
-     * <script>
-     *   shadowProxy.initProxy();
-     *   shadowProxy.template.meuComponente.titulo = 'Olá!';
-     * </script>
-     * ```
-     */
     return {
 
-        /** @type {string} Nome da biblioteca. */
         name: 'shadow-proxy',
+        version: '2.8.0',
 
-        /** @type {string} Versão semântica atual. */
-        version: '2.7.4',
-
-        /**
-         * Proxy raiz que expõe os stores de cada componente.
-         *
-         * Acesse via `shadowProxy.template.<key>` para ler ou escrever props reativas.
-         * Cada acesso retorna um Proxy reativo — atribuições disparam re-render.
-         *
-         * Atalho de destruição disponível por componente:
-         * ```js
-         * shadowProxy.template.meuComponente.destroy();
-         * ```
-         *
-         * @type {Object.<string, Object>}
-         *
-         * @example
-         * shadowProxy.template.lista.itens = [{ nome: 'A' }, { nome: 'B' }];
-         * shadowProxy.template.form.titulo = 'Novo título';
-         */
+        /** Proxy raiz dos stores: shadowProxy.template.<key>.<prop> = valor */
         template: {},
 
-        /**
-         * Handler global de erros da biblioteca.
-         *
-         * Se definido, substitui o `console.error` padrão.
-         * Recebe um objeto com os campos abaixo — campos extras variam por tipo.
-         *
-         * @type {((err: {
-         *   type      : 'x-for-syntax'|'x-on-unsafe'|'x-bind-eval'|'x-if-eval'|
-         *               'render-error'|'model-path'|'watcher-error'|'lifecycle-error'|
-         *               'proxy-target'|'security-blocked',
-         *   message   : string,
-         *   timestamp : number,
-         *   expr?     : string,
-         *   element?  : string,
-         *   attr?     : string,
-         *   path?     : string,
-         *   component?: string,
-         * }) => void) | null}
-         *
-         * @example
-         * shadowProxy.onError = function (err) {
-         *   console.warn('[meu-app]', err.type, err.message, err);
-         * };
-         */
+        /** Handler global de erros (substitui console.error). Recebe { type, message, timestamp, ... } */
         onError: null,
 
         /**
-         * Observa mudanças em qualquer caminho profundo do store.
-         *
-         * O callback é chamado com `(newVal, oldVal)` sempre que o valor
-         * do caminho — ou qualquer prop descendente — for alterado.
-         * Mudanças em props filhas borbulham até o caminho observado.
-         *
-         * @param  {string}   path  Caminho com notação de ponto: `'key.prop.sub'`.
-         * @param  {(newVal: *, oldVal: *) => void} fn  Callback chamado na mudança.
-         * @returns {() => void} Função de unsubscribe — chame para parar de observar.
-         *
-         * @example
-         * const unsub = shadowProxy.on('carrinho.itens', (novo, antigo) => {
-         *   console.log('itens mudaram', novo);
-         * });
-         *
-         * // Para de observar:
-         * unsub();
+         * Observa qualquer caminho profundo do store. Retorna função de unsubscribe.
+         * shadowProxy.on('carrinho.itens', (novo, antigo) => {})
          */
         on: function (path, fn) {
             return _registerWatcher(path, fn);
         },
 
-        /**
-         * Registra listeners de `x-on:*` em elementos dentro de `root`.
-         *
-         * Chamado automaticamente pelo ciclo de render — use manualmente apenas
-         * ao injetar HTML dinamicamente fora do fluxo normal do proxy.
-         *
-         * Expressões são validadas pelo sandbox antes do bind.
-         * Expressões com props ainda inexistentes no store são agendadas para
-         * retry automático no próximo render do componente.
-         *
-         * @param {Element} root   Elemento raiz a partir do qual os `x-on:*` são buscados.
-         * @param {Object}  scope  Escopo de variáveis disponíveis nas expressões.
-         * @param {string}  [key]  Chave do componente (`x-data` / `proxy-target`).
-         * @returns {void}
-         *
-         * @example
-         * // Uso manual após injeção de HTML dinâmico:
-         * const container = document.querySelector('[x-data="feed"]');
-         * shadowProxy.bindEvents(container, shadowProxy.template.feed, 'feed');
-         */
+        /** Registra x-on:* dentro de root (uso manual após injetar HTML dinâmico). */
         bindEvents: _bindEvents,
 
-        /**
-         * Inicializa o two-way binding para todos os elementos `x-model` no documento.
-         *
-         * Deve ser chamado uma vez após `initProxy()`, ou novamente após injetar
-         * novos elementos `x-model` no DOM (ex: troca de página via fetch).
-         *
-         * Suporta `<input type="text">`, `<input type="checkbox">`,
-         * `<input type="radio">` e `<select>`.
-         *
-         * @returns {void}
-         *
-         * @example
-         * shadowProxy.initProxy();
-         * shadowProxy.initModels();
-         */
+        /** Inicializa x-model no documento (ou em root). Chamar de novo após injetar HTML. */
         initModels: _initModels,
 
-        /**
-         * Destrói um componente ou todos os componentes registrados.
-         *
-         * Remove listeners de eventos, efeitos reativos, watchers, model registry
-         * e limpa o store interno do(s) componente(s).
-         *
-         * Dispara os lifecycle hooks `$beforeDestroy` / `$afterDestroy` e os
-         * eventos DOM `before-destroy` / `after-destroy` no elemento alvo.
-         *
-         * @param {string} [key] Chave do componente a destruir.
-         *                       Se omitida, destrói **todos** os componentes.
-         * @returns {void}
-         *
-         * @example
-         * // Destrói apenas um componente:
-         * shadowProxy.destroy('meuComponente');
-         *
-         * // Ou via atalho no próprio template:
-         * shadowProxy.template.meuComponente.destroy();
-         *
-         * // Destrói tudo (ex: troca de página):
-         * shadowProxy.destroy();
-         */
+        /** Destrói um componente (key) ou todos. Dispara $beforeDestroy/$afterDestroy. */
         destroy: function (key) {
             if (key) {
                 _destroyKey(key);
@@ -2099,66 +2073,71 @@ var shadowProxy = (function () {
             }
         },
 
-        /**
-         * Inicializa o sistema reativo.
-         *
-         * Deve ser chamado uma vez após o DOM estar pronto.
-         * Varre todos os elementos `[proxy-target]` e `[x-data]`, cacheia
-         * os templates de `x-for` e configura o Proxy raiz em `shadowProxy.template`.
-         *
-         * Pode ser chamado novamente após `destroy()` para reinicializar
-         * componentes (ex: navegação via fetch sem reload de página).
-         *
-         * @returns {void}
-         *
-         * @example
-         * document.addEventListener('DOMContentLoaded', function () {
-         *   shadowProxy.initProxy();
-         *   shadowProxy.initModels();
-         *
-         *   shadowProxy.template.app.titulo   = 'Olá mundo';
-         *   shadowProxy.template.app.lista    = [{ nome: 'Item 1' }];
-         * });
-         */
+        /** Inicializa o sistema reativo (após DOM pronto). Pode ser chamado de novo após destroy(). */
         initProxy: function () {
             const self = this;
 
+            if (!document.getElementById('shadow-proxy-cloak')) {
+                const st = document.createElement('style');
+                st.id = 'shadow-proxy-cloak';
+                st.textContent = '[x-cloak]{display:none!important}';
+                (document.head || document.documentElement).appendChild(st);
+            }
+
             document.querySelectorAll('[proxy-target], [x-data]').forEach(function (el) {
                 const key = el.getAttribute('proxy-target') || el.getAttribute('x-data');
+                if (!key) {
+                    _reportError(ERROR_TYPES.PROXY_TARGET, 'x-data / proxy-target sem nome', { element: _elementId(el) });
+                    return;
+                }
                 if (!_store[key]) _store[key] = {};
-                _cacheTemplates(el); // cacheia x-for templates antes de qualquer render (fix: arrays vazios)
+                if (!_proxies[key]) _proxies[key] = _makeProxy(_store[key], key);
+                if (el.hasAttribute('x-for')) _cacheNode(el);
+                _cacheTemplates(el);
+                _scheduleApply(key);   // 1º render (limpa x-for vazio, remove x-cloak)
             });
 
             self.template = new Proxy(_store, {
                 get(target, key) {
                     if (key === '__raw__') return target;
+                    if (typeof key !== 'string' || key === 'then' || key === 'toJSON') return undefined;
                     if (!target[key]) target[key] = {};
-                    // Recria proxy se o raw mudou (ex: após destroy)
                     if (!_proxies[key] || _proxies[key].__raw !== target[key]) {
                         _proxies[key] = _makeProxy(target[key], key);
                     }
-                    // Injeta .destroy() diretamente no raw do key
                     const raw = target[key];
-                    if (raw && !raw.__destroyBound) {
+                    if (raw && typeof raw === 'object' && !_destroyBound.has(raw) && Object.isExtensible(raw)) {
                         Object.defineProperty(raw, 'destroy', {
                             configurable: true,
                             enumerable: false,
                             value: function () { _destroyKey(key); }
                         });
-                        raw.__destroyBound = true;
+                        _destroyBound.add(raw);
                     }
                     return _proxies[key];
                 },
                 set(target, key, value) {
+                    if (typeof key !== 'string') return false;
+                    if (value && typeof value === 'object' && value[_PROXY_SYM]) value = value.__raw;
+
+                    const oldVal = target[key];
                     target[key] = value;
-                    _proxies[key] = _makeProxy(target[key], key);
+                    if (value && typeof value === 'object') _proxies[key] = _makeProxy(value, key);
+                    else delete _proxies[key];
+
+                    // Watchers: caminho exato + descendentes
+                    _notifyWatchers(key, value, oldVal, new Map());
+                    Object.keys(_watchers).forEach(function (p) {
+                        if (!p.startsWith(key + '.')) return;
+                        const rest = p.slice(key.length + 1).split('.');
+                        _notifyWatchers(p, _pick(value, rest), _pick(oldVal, rest), new Map(), true);
+                    });
+
                     _scheduleApply(key);
                     return true;
                 }
             });
 
-            // Auto-inicializa x-model — _initModels já faz querySelectorAll('[x-model]')
-            // e sai cedo se não encontrar nada, então é seguro chamar sempre.
             _initModels();
         }
     };
